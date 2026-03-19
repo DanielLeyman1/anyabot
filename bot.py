@@ -112,6 +112,17 @@ def admin_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
+MONTH_NAMES = (
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+)
+
+
+def calendar_title(current_date: date) -> str:
+    """Заголовок для календаря: месяц и год."""
+    return f"{MONTH_NAMES[current_date.month - 1]} {current_date.year}"
+
+
 def generate_calendar_keyboard(current_date: date) -> InlineKeyboardMarkup:
     today = date.today()
     end_date = today + timedelta(days=14)
@@ -187,6 +198,18 @@ def generate_time_keyboard(selected_date: date, existing_slots: List[datetime]) 
 
 user_states: Dict[int, Dict[str, str]] = {}
 
+# Человекочитаемые статусы тренировок
+STATUS_LABELS = {
+    "scheduled": "запланирована",
+    "cancelled": "отменена",
+    "completed": "проведена",
+    "missed": "пропущена",
+}
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
 
 async def ensure_user(message: Message) -> User:
     with get_session() as session:
@@ -256,9 +279,23 @@ async def handle_main_menu(message: Message):
     user = await ensure_user(message)
     text = message.text or ""
 
+    # Пока нет телефона — не показываем основное меню, просим контакт
+    if not user.phone:
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📱 Отправить телефон", request_contact=True)]
+            ],
+            resize_keyboard=True,
+        )
+        await message.answer(
+            "Для доступа к тренировкам нужна регистрация: отправь свой номер телефона кнопкой ниже.",
+            reply_markup=kb,
+        )
+        return
+
     if text == "Тренировки":
         await message.answer(
-            "Выбери действие:",
+            "Здесь можно записаться на тренировку, отменить или перенести запись, посмотреть свои записи.",
             reply_markup=trainings_menu_kb(),
         )
     elif text == "Мой пакет":
@@ -288,10 +325,17 @@ async def handle_main_menu(message: Message):
 
 
 async def send_my_package(message: Message, user: User):
-    await message.answer(
-        f"Твой пакет тренировок:\n"
+    text = (
+        f"📦 Твой пакет тренировок\n\n"
         f"Всего: {user.package_total}\n"
-        f"Осталось: {user.package_remaining}",
+        f"Осталось: {user.package_remaining}"
+    )
+    if user.package_remaining > 0:
+        text += "\n\nЗаписаться можно в разделе «Тренировки»."
+    else:
+        text += "\n\nЧтобы записаться, попроси тренера пополнить пакет."
+    await message.answer(
+        text,
         reply_markup=main_menu_kb(is_admin=user.is_admin),
     )
 
@@ -308,7 +352,7 @@ async def start_booking_flow(message: Message, user: User):
 
     today = date.today()
     await message.answer(
-        "Выбери дату для тренировки:",
+        f"📅 {calendar_title(today)}\n\nВыбери дату для тренировки:",
         reply_markup=generate_calendar_keyboard(today),
     )
 
@@ -365,7 +409,10 @@ async def send_my_bookings(message: Message, user: User):
         trainings = session.scalars(stmt).all()
 
     if not trainings:
-        await message.answer("У тебя пока нет записей.")
+        await message.answer(
+            "У тебя пока нет записей. Записаться можно через кнопку «Записаться на тренировку».",
+            reply_markup=trainings_menu_kb(),
+        )
         return
 
     lines = []
@@ -376,9 +423,12 @@ async def send_my_bookings(message: Message, user: User):
             "completed": "🏁",
             "missed": "⚠️",
         }.get(t.status, "")
-        lines.append(f"{status_emoji} {t.start_at.strftime('%d.%m %H:%M')} — {t.status}")
+        lines.append(f"{status_emoji} {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}")
 
-    await message.answer("\n".join(lines))
+    await message.answer(
+        "Твои записи (активные и недавние):\n\n" + "\n".join(lines),
+        reply_markup=trainings_menu_kb(),
+    )
 
 
 async def cb_calendar_navigation(callback: CallbackQuery):
@@ -387,7 +437,7 @@ async def cb_calendar_navigation(callback: CallbackQuery):
     _, date_str = callback.data.split(":", 1)
     target_date = date.fromisoformat(date_str)
     await callback.message.edit_text(
-        "Выбери дату для тренировки:",
+        f"📅 {calendar_title(target_date)}\n\nВыбери дату для тренировки:",
         reply_markup=generate_calendar_keyboard(target_date),
     )
     await callback.answer()
@@ -396,13 +446,21 @@ async def cb_calendar_navigation(callback: CallbackQuery):
 async def cb_cancel_booking_flow(callback: CallbackQuery):
     user_states.pop(callback.from_user.id, None)
     await callback.message.edit_text("Запись на тренировку отменена.")
+    try:
+        await callback.bot.send_message(
+            chat_id=callback.from_user.id,
+            text="Выбери действие в меню «Тренировки»:",
+            reply_markup=trainings_menu_kb(),
+        )
+    except Exception:
+        pass
     await callback.answer()
 
 
 async def cb_back_to_dates(callback: CallbackQuery):
     today = date.today()
     await callback.message.edit_text(
-        "Выбери дату для тренировки:",
+        f"📅 {calendar_title(today)}\n\nВыбери дату для тренировки:",
         reply_markup=generate_calendar_keyboard(today),
     )
     await callback.answer()
@@ -478,9 +536,17 @@ async def cb_select_time(callback: CallbackQuery):
             session.refresh(t)
 
             await callback.message.edit_text(
-                f"Ты записан на тренировку {selected_dt.strftime('%d.%m %H:%M')}.\n"
-                f"Осталось тренировок: {user.package_remaining}",
+                f"✅ Ты записан на тренировку {selected_dt.strftime('%d.%m %H:%M')}.\n"
+                f"Осталось тренировок в пакете: {user.package_remaining}",
             )
+            try:
+                await callback.bot.send_message(
+                    chat_id=user_id,
+                    text="Можешь записаться ещё или посмотреть «Мои записи».",
+                    reply_markup=trainings_menu_kb(),
+                )
+            except Exception:
+                pass
 
             await callback.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -522,18 +588,20 @@ async def cb_select_time(callback: CallbackQuery):
             session.commit()
 
             await callback.message.edit_text(
-                f"Тренировка перенесена с {old_time.strftime('%d.%m %H:%M')} "
+                f"✅ Тренировка перенесена с {old_time.strftime('%d.%m %H:%M')} "
                 f"на {t.start_at.strftime('%d.%m %H:%M')}."
             )
-
-            await callback.bot.send_message(
-                chat_id=user.tg_id,
-                text=(
-                    f"Ты перенёс свою тренировку.\n"
-                    f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
-                ),
-            )
-
+            try:
+                await callback.bot.send_message(
+                    chat_id=user.tg_id,
+                    text=(
+                        f"Ты перенёс свою тренировку.\n"
+                        f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
+                    ),
+                    reply_markup=trainings_menu_kb(),
+                )
+            except Exception:
+                pass
             await callback.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
@@ -541,7 +609,6 @@ async def cb_select_time(callback: CallbackQuery):
                     f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
                 ),
             )
-
             user_states.pop(user_id, None)
             await callback.answer()
         elif flow == "admin_reschedule":
@@ -653,10 +720,17 @@ async def cb_cancel_my(callback: CallbackQuery):
         session.commit()
 
         await callback.message.edit_text(
-            f"Тренировка на {t.start_at.strftime('%d.%m %H:%M')} отменена.\n"
-            + ("Тренировка вернулась в твой пакет." if refundable else "Меньше чем за 4 часа, тренировка сгорает."),
+            f"❌ Тренировка на {t.start_at.strftime('%d.%m %H:%M')} отменена.\n"
+            + ("Тренировка вернулась в твой пакет." if refundable else "Меньше чем за 4 часа — тренировка сгорает."),
         )
-
+        try:
+            await callback.bot.send_message(
+                chat_id=user_tg_id,
+                text="Можешь записаться на другое время или посмотреть «Мои записи».",
+                reply_markup=trainings_menu_kb(),
+            )
+        except Exception:
+            pass
         await callback.bot.send_message(
             chat_id=ADMIN_ID,
             text=(
@@ -693,7 +767,7 @@ async def cb_reschedule_my(callback: CallbackQuery):
 
     today = date.today()
     await callback.message.edit_text(
-        "Выбери новую дату для переноса тренировки:",
+        f"📅 {calendar_title(today)}\n\nВыбери новую дату для переноса тренировки:",
         reply_markup=generate_calendar_keyboard(today),
     )
     await callback.answer()
@@ -788,21 +862,23 @@ async def cb_client_card(callback: CallbackQuery):
         )
         trainings = session.scalars(stmt).all()
 
+    client_name = f"{client.first_name or ''} {client.last_name or ''}".strip()
+    if not client_name:
+        client_name = f"@{client.username}" if client.username else f"ID {client.tg_id}"
     caption_lines = [
-        f"Клиент: {client.first_name or ''} {client.last_name or ''}".strip(),
-        f"username: @{client.username}" if client.username else "",
-        f"Телефон: {client.phone or 'не указан'}",
-        f"Пакет: всего {client.package_total}, осталось {client.package_remaining}",
+        f"👤 Клиент: {client_name}",
+        f"📱 Телефон: {client.phone or 'не указан'}",
+        f"📦 Пакет: всего {client.package_total}, осталось {client.package_remaining}",
         "",
         "Ближайшие тренировки:",
     ]
     if trainings:
         for t in trainings[:10]:
             caption_lines.append(
-                f"- {t.start_at.strftime('%d.%m %H:%M')} ({t.status})"
+                f"• {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}"
             )
     else:
-        caption_lines.append("нет записей")
+        caption_lines.append("— нет записей")
 
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -838,7 +914,7 @@ async def cb_set_package(callback: CallbackQuery):
     }
 
     await callback.message.edit_text(
-        "Введи количество тренировок для клиента (целое число):"
+        "Введи количество тренировок для клиента (целое число).\nОтменить: напиши «отмена»."
     )
     await callback.answer()
 
@@ -850,12 +926,16 @@ async def handle_admin_text(message: Message):
 
     if state.get("action") == "set_package":
         client_id = int(state["client_id"])
+        if message.text.strip().lower() in ("отмена", "отменить", "cancel"):
+            admin_states.pop(message.from_user.id, None)
+            await message.answer("Действие отменено.", reply_markup=admin_menu_kb())
+            return True
         try:
             value = int(message.text.strip())
             if value < 0:
                 raise ValueError
         except Exception:
-            await message.answer("Нужно ввести неотрицательное целое число.")
+            await message.answer("Нужно ввести неотрицательное целое число (или напиши «отмена»).")
             return True
 
         with get_session() as session:
@@ -913,7 +993,7 @@ async def cb_client_trainings(callback: CallbackQuery):
     text_lines = ["Записи клиента:"]
     for t in trainings:
         text_lines.append(
-            f"{t.id}: {t.start_at.strftime('%d.%m %H:%M')} ({t.status})"
+            f"{t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}"
         )
         builder.button(
             text=f"{t.start_at.strftime('%d.%m %H:%M')}",
@@ -963,7 +1043,7 @@ async def cb_admin_training(callback: CallbackQuery):
         f"Тренировка ID {t.id}\n"
         f"Клиент: @{client.username or client.first_name}\n"
         f"Время: {t.start_at.strftime('%d.%m %H:%M')}\n"
-        f"Статус: {t.status}",
+        f"Статус: {status_label(t.status)}",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
@@ -1022,7 +1102,7 @@ async def cb_admin_reschedule_training(callback: CallbackQuery):
 
     today = date.today()
     await callback.message.edit_text(
-        "Выбери новую дату для тренировки клиента:",
+        f"📅 {calendar_title(today)}\n\nВыбери новую дату для тренировки клиента:",
         reply_markup=generate_calendar_keyboard(today),
     )
     await callback.answer()
@@ -1056,7 +1136,7 @@ async def admin_show_all_trainings(message: Message, page: int = 0):
         text_lines = [f"Все записи. Страница {page + 1}:"]
         for t in trainings:
             text_lines.append(
-                f"{t.id}: {t.start_at.strftime('%d.%m %H:%M')} — {t.status} — "
+                f"{t.id}: {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)} — "
                 f"@{t.user.username or t.user.first_name}"
             )
 
