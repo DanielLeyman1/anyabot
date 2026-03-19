@@ -44,6 +44,12 @@ DATABASE_URL = "sqlite:///booking_bot.db"
 
 # Минимум за сколько до начала слота можно записаться / перенести (новое время)
 BOOKING_MIN_ADVANCE = timedelta(hours=1)
+MASSAGE_MIN_ADVANCE = timedelta(minutes=30)
+SESSION_DURATION = timedelta(hours=1)
+MASSAGE_BUFFER_AFTER_ANY_SESSION = timedelta(minutes=30)
+
+SERVICE_TRAINING = "training"
+SERVICE_MASSAGE = "massage"
 
 # Часовой пояс расписания (слоты и «сейчас» для записи)
 APP_TZ = ZoneInfo("Asia/Yekaterinburg")
@@ -75,6 +81,8 @@ class User(Base):
     is_admin = Column(Boolean, default=False)
     package_total = Column(Integer, default=0)
     package_remaining = Column(Integer, default=0)
+    massage_package_total = Column(Integer, default=0)
+    massage_package_remaining = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     trainings = relationship("Training", back_populates="user")
@@ -85,6 +93,7 @@ class Training(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    service_type = Column(String, default=SERVICE_TRAINING)
     start_at = Column(DateTime, nullable=False)
     status = Column(String, default="scheduled")  # scheduled, cancelled, completed, missed
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -104,8 +113,29 @@ Base.metadata.create_all(bind=engine)
 def ensure_db_columns():
     """Добавить колонки в существующую SQLite-БД (create_all не меняет старые таблицы)."""
     with engine.begin() as conn:
+        user_rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        user_col_names = {r[1] for r in user_rows}
+        if "massage_package_total" not in user_col_names:
+            conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN massage_package_total INTEGER DEFAULT 0"
+                )
+            )
+        if "massage_package_remaining" not in user_col_names:
+            conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN massage_package_remaining INTEGER DEFAULT 0"
+                )
+            )
+
         rows = conn.execute(text("PRAGMA table_info(trainings)")).fetchall()
         col_names = {r[1] for r in rows}
+        if "service_type" not in col_names:
+            conn.execute(
+                text(
+                    f"ALTER TABLE trainings ADD COLUMN service_type VARCHAR DEFAULT '{SERVICE_TRAINING}'"
+                )
+            )
         if "post_session_prompt_sent" not in col_names:
             conn.execute(
                 text(
@@ -140,6 +170,7 @@ def get_session() -> Session:
 def main_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="Тренировки")],
+        [KeyboardButton(text="Массаж")],
         [KeyboardButton(text="Мой пакет")],
     ]
     if is_admin:
@@ -152,6 +183,18 @@ def trainings_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📝 Записаться на тренировку")],
         [KeyboardButton(text="❌ Отменить/перенести запись")],
         [KeyboardButton(text="📋 Мои записи")],
+        [KeyboardButton(text="📦 Мой пакет тренировок")],
+        [KeyboardButton(text="⬅️ Назад в меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def massage_menu_kb() -> ReplyKeyboardMarkup:
+    buttons = [
+        [KeyboardButton(text="💆 Записаться на массаж")],
+        [KeyboardButton(text="❌ Отменить/перенести массаж")],
+        [KeyboardButton(text="📋 Мои массажи")],
+        [KeyboardButton(text="📦 Мой пакет массажа")],
         [KeyboardButton(text="⬅️ Назад в меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -160,7 +203,8 @@ def trainings_menu_kb() -> ReplyKeyboardMarkup:
 def admin_menu_kb() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="👥 Клиенты")],
-        [KeyboardButton(text="📆 Все записи")],
+        [KeyboardButton(text="📆 Все записи (Тренировки)")],
+        [KeyboardButton(text="📆 Все записи (Массаж)")],
         [KeyboardButton(text="⬅️ Назад в меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -175,15 +219,20 @@ WEEKDAYS_SHORT_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 MY_BOOK_ROOT = "mybook:root"
 MY_BOOK_ALL = "mybook:all"
+MY_MASS_ROOT = "mymass:root"
+MY_MASS_ALL = "mymass:all"
 
 # Админ: «Все записи» — тот же UX, что «Мои записи» у клиента
 ADM_ALL_ROOT = "admtrbook:root"
 ADM_ALL_ALL = "admtrbook:all"
+ADM_MASS_ROOT = "admmass:root"
+ADM_MASS_ALL = "admmass:all"
 
 
-def admin_all_bookings_root_text(has_any: bool) -> str:
+def admin_all_bookings_root_text(has_any: bool, service_type: str = SERVICE_TRAINING) -> str:
+    title = "Все текущие записи (Массаж):" if service_type == SERVICE_MASSAGE else "Все текущие записи (Тренировки):"
     lines = [
-        "Все текущие записи:",
+        title,
         "",
         "Выбери день (неделя вперёд) или нажми «Показать все записи».",
     ]
@@ -192,7 +241,7 @@ def admin_all_bookings_root_text(has_any: bool) -> str:
     return "\n".join(lines)
 
 
-def build_admin_all_bookings_keyboard() -> InlineKeyboardMarkup:
+def build_admin_all_bookings_keyboard(service_type: str = SERVICE_TRAINING) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     today = today_local()
     for i in range(7):
@@ -200,13 +249,17 @@ def build_admin_all_bookings_keyboard() -> InlineKeyboardMarkup:
         wd = WEEKDAYS_SHORT_RU[d.weekday()]
         builder.button(
             text=f"{wd} {d.strftime('%d.%m')}",
-            callback_data=f"admtrbookday:{d.isoformat()}",
+            callback_data=(
+                f"admmassday:{d.isoformat()}"
+                if service_type == SERVICE_MASSAGE
+                else f"admtrbookday:{d.isoformat()}"
+            ),
         )
     builder.adjust(3)
     builder.row(
         InlineKeyboardButton(
             text="📋 Показать все записи",
-            callback_data=ADM_ALL_ALL,
+            callback_data=ADM_MASS_ALL if service_type == SERVICE_MASSAGE else ADM_ALL_ALL,
         )
     )
     return builder.as_markup()
@@ -258,25 +311,46 @@ def generate_calendar_keyboard(current_date: date) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def earliest_bookable_moment() -> datetime:
-    """Слот доступен только если до его начала не меньше BOOKING_MIN_ADVANCE (локальное время)."""
+def earliest_bookable_moment(service_type: str) -> datetime:
+    if service_type == SERVICE_MASSAGE:
+        return now_naive_local() + MASSAGE_MIN_ADVANCE
     return now_naive_local() + BOOKING_MIN_ADVANCE
+
+
+def is_slot_available_for_service(
+    candidate_start: datetime,
+    existing_slots: List[datetime],
+    service_type: str,
+) -> bool:
+    candidate_end = candidate_start + SESSION_DURATION
+    for existing_start in existing_slots:
+        existing_end = existing_start + SESSION_DURATION
+        overlaps = candidate_start < existing_end and candidate_end > existing_start
+        if overlaps:
+            return False
+        # Для массажа нужен буфер 30 минут после любого уже стоящего сеанса.
+        if (
+            service_type == SERVICE_MASSAGE
+            and existing_end <= candidate_start
+            and candidate_start < existing_end + MASSAGE_BUFFER_AFTER_ANY_SESSION
+        ):
+            return False
+    return True
 
 
 def generate_time_keyboard(
     selected_date: date,
     existing_slots: List[datetime],
+    service_type: str = SERVICE_TRAINING,
     skip_min_advance: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
-    start_time = time(9, 0)
+    start_time = time(8, 0)
     end_time = time(19, 0)
 
-    occupied_times = {dt.time() for dt in existing_slots}
-
     current_datetime = now_naive_local()
-    min_slot_start = earliest_bookable_moment()
+    min_slot_start = earliest_bookable_moment(service_type)
 
     dt = datetime.combine(selected_date, start_time)
     while dt.time() <= end_time:
@@ -290,7 +364,7 @@ def generate_time_keyboard(
             dt += timedelta(minutes=15)
             continue
 
-        if dt.time() not in occupied_times:
+        if is_slot_available_for_service(dt, existing_slots, service_type):
             builder.button(
                 text=dt.strftime("%H:%M"),
                 callback_data=f"time:{dt.isoformat()}",
@@ -430,6 +504,11 @@ async def handle_main_menu(message: Message):
             "Здесь можно записаться на тренировку, отменить или перенести запись, посмотреть свои записи.",
             reply_markup=trainings_menu_kb(),
         )
+    elif text == "Массаж":
+        await message.answer(
+            "Здесь можно записаться на массаж, отменить или перенести запись, посмотреть свои записи.",
+            reply_markup=massage_menu_kb(),
+        )
     elif text == "Мой пакет":
         await send_my_package(message, user)
     elif text == "🛠 Админ панель" and user.is_admin and is_channel_admin(
@@ -442,19 +521,33 @@ async def handle_main_menu(message: Message):
             reply_markup=main_menu_kb(is_admin=user.is_admin),
         )
     elif text == "📝 Записаться на тренировку":
-        await start_booking_flow(message, user)
+        await start_booking_flow(message, user, SERVICE_TRAINING)
+    elif text == "💆 Записаться на массаж":
+        await start_booking_flow(message, user, SERVICE_MASSAGE)
     elif text == "❌ Отменить/перенести запись":
-        await start_cancel_reschedule_flow(message, user)
+        await start_cancel_reschedule_flow(message, user, SERVICE_TRAINING)
+    elif text == "❌ Отменить/перенести массаж":
+        await start_cancel_reschedule_flow(message, user, SERVICE_MASSAGE)
     elif text == "📋 Мои записи":
-        await send_my_bookings(message, user)
+        await send_my_bookings(message, user, SERVICE_TRAINING)
+    elif text == "📋 Мои массажи":
+        await send_my_bookings(message, user, SERVICE_MASSAGE)
+    elif text == "📦 Мой пакет тренировок":
+        await send_service_package(message, user, SERVICE_TRAINING)
+    elif text == "📦 Мой пакет массажа":
+        await send_service_package(message, user, SERVICE_MASSAGE)
     elif text == "👥 Клиенты" and user.is_admin and is_channel_admin(
         message.from_user.id
     ):
         await admin_show_clients(message, page=0)
-    elif text == "📆 Все записи" and user.is_admin and is_channel_admin(
+    elif text == "📆 Все записи (Тренировки)" and user.is_admin and is_channel_admin(
         message.from_user.id
     ):
-        await admin_show_all_trainings(message)
+        await admin_show_all_trainings(message, SERVICE_TRAINING)
+    elif text == "📆 Все записи (Массаж)" and user.is_admin and is_channel_admin(
+        message.from_user.id
+    ):
+        await admin_show_all_trainings(message, SERVICE_MASSAGE)
     else:
         await message.answer(
             "Не понял команду. Используй кнопки меню ниже.",
@@ -464,12 +557,40 @@ async def handle_main_menu(message: Message):
 
 async def send_my_package(message: Message, user: User):
     text = (
-        f"📦 Твой пакет тренировок\n\n"
-        f"Всего: {user.package_total}\n"
-        f"Осталось: {user.package_remaining}"
+        "📦 Твои пакеты\n\n"
+        f"Тренировки: всего {user.package_total}, осталось {user.package_remaining}\n"
+        f"Массаж: всего {user.massage_package_total}, осталось {user.massage_package_remaining}"
     )
-    if user.package_remaining > 0:
-        text += "\n\nЗаписаться можно в разделе «Тренировки»."
+    await message.answer(text, reply_markup=main_menu_kb(is_admin=user.is_admin))
+
+
+def service_label(service_type: str) -> str:
+    return "массаж" if service_type == SERVICE_MASSAGE else "тренировку"
+
+
+def service_plural(service_type: str) -> str:
+    return "массажей" if service_type == SERVICE_MASSAGE else "тренировок"
+
+
+async def send_service_package(message: Message, user: User, service_type: str):
+    if service_type == SERVICE_MASSAGE:
+        total = user.massage_package_total
+        remaining = user.massage_package_remaining
+        title = "💆 Твой пакет массажа"
+        menu_section = "«Массаж»"
+    else:
+        total = user.package_total
+        remaining = user.package_remaining
+        title = "📦 Твой пакет тренировок"
+        menu_section = "«Тренировки»"
+
+    text = (
+        f"{title}\n\n"
+        f"Всего: {total}\n"
+        f"Осталось: {remaining}"
+    )
+    if remaining > 0:
+        text += f"\n\nЗаписаться можно в разделе {menu_section}."
     else:
         text += "\n\nЧтобы записаться, попроси тренера пополнить пакет."
     await message.answer(
@@ -478,21 +599,27 @@ async def send_my_package(message: Message, user: User):
     )
 
 
-async def start_booking_flow(message: Message, user: User):
-    if user.package_remaining <= 0:
+async def start_booking_flow(message: Message, user: User, service_type: str):
+    remaining = (
+        user.massage_package_remaining
+        if service_type == SERVICE_MASSAGE
+        else user.package_remaining
+    )
+    if remaining <= 0:
         await message.answer(
-            "У тебя нет доступных тренировок. Обратись к тренеру, чтобы пополнить пакет.",
+            f"У тебя нет доступных {service_plural(service_type)}. Обратись к тренеру, чтобы пополнить пакет.",
             reply_markup=main_menu_kb(is_admin=user.is_admin),
         )
         return
 
-    user_states[message.from_user.id] = {"flow": "booking"}
+    user_states[message.from_user.id] = {"flow": "booking", "service_type": service_type}
 
     today = today_local()
+    min_advance_text = "30 минут" if service_type == SERVICE_MASSAGE else "1 час"
     await message.answer(
         f"📅 {calendar_title(today)}\n\n"
-        f"Выбери дату для тренировки.\n"
-        f"⏱ Запись только не позднее чем за <b>1 час</b> до начала слота.",
+        f"Выбери дату для записи на {service_label(service_type)}.\n"
+        f"⏱ Запись только не позднее чем за <b>{min_advance_text}</b> до начала слота.",
         reply_markup=generate_calendar_keyboard(today),
     )
 
@@ -528,13 +655,34 @@ def build_my_bookings_root_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-async def start_cancel_reschedule_flow(message: Message, user: User):
+def build_my_massage_root_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    today = today_local()
+    for i in range(7):
+        d = today + timedelta(days=i)
+        wd = WEEKDAYS_SHORT_RU[d.weekday()]
+        builder.button(
+            text=f"{wd} {d.strftime('%d.%m')}",
+            callback_data=f"mymassday:{d.isoformat()}",
+        )
+    builder.adjust(3)
+    builder.row(
+        InlineKeyboardButton(
+            text="📋 Показать все записи",
+            callback_data=MY_MASS_ALL,
+        )
+    )
+    return builder.as_markup()
+
+
+async def start_cancel_reschedule_flow(message: Message, user: User, service_type: str):
     with get_session() as session:
         stmt = (
             select(Training)
             .where(
                 and_(
                     Training.user_id == user.id,
+                    Training.service_type == service_type,
                     Training.status == "scheduled",
                     Training.start_at >= now_naive_local(),
                 )
@@ -546,7 +694,7 @@ async def start_cancel_reschedule_flow(message: Message, user: User):
     if not trainings:
         await message.answer(
             "У тебя нет активных записей для отмены или переноса.",
-            reply_markup=trainings_menu_kb(),
+            reply_markup=massage_menu_kb() if service_type == SERVICE_MASSAGE else trainings_menu_kb(),
         )
         return
 
@@ -560,18 +708,19 @@ async def start_cancel_reschedule_flow(message: Message, user: User):
     builder.adjust(1)
 
     await message.answer(
-        "Выбери тренировку для отмены или переноса:",
+        f"Выбери {service_label(service_type)} для отмены или переноса:",
         reply_markup=builder.as_markup(),
     )
 
 
-async def send_my_bookings(message: Message, user: User):
+async def send_my_bookings(message: Message, user: User, service_type: str = SERVICE_TRAINING):
     now = now_naive_local()
     with get_session() as session:
         cnt = session.scalar(
             select(func.count(Training.id)).where(
                 and_(
                     Training.user_id == user.id,
+                    Training.service_type == service_type,
                     Training.status == "scheduled",
                     Training.start_at >= now,
                 )
@@ -580,8 +729,8 @@ async def send_my_bookings(message: Message, user: User):
         has_upcoming = (cnt or 0) > 0
 
     await message.answer(
-        my_bookings_root_text(has_upcoming),
-        reply_markup=build_my_bookings_root_keyboard(),
+        my_bookings_root_text(has_upcoming) if service_type == SERVICE_TRAINING else "Мои текущие массажи:\n\nВыбери день (на неделю вперёд) или нажми «Показать все записи».",
+        reply_markup=build_my_bookings_root_keyboard() if service_type == SERVICE_TRAINING else build_my_massage_root_keyboard(),
     )
 
 
@@ -597,6 +746,7 @@ async def cb_my_bookings_root(callback: CallbackQuery):
             select(func.count(Training.id)).where(
                 and_(
                     Training.user_id == u.id,
+                    Training.service_type == SERVICE_TRAINING,
                     Training.status == "scheduled",
                     Training.start_at >= now,
                 )
@@ -633,6 +783,7 @@ async def cb_my_bookings_day(callback: CallbackQuery):
             .where(
                 and_(
                     Training.user_id == u.id,
+                    Training.service_type == SERVICE_TRAINING,
                     Training.status == "scheduled",
                     func.date(Training.start_at) == target_date,
                 )
@@ -679,6 +830,7 @@ async def cb_my_bookings_all(callback: CallbackQuery):
             .where(
                 and_(
                     Training.user_id == u.id,
+                    Training.service_type == SERVICE_TRAINING,
                     Training.status == "scheduled",
                     Training.start_at >= now,
                 )
@@ -706,26 +858,137 @@ async def cb_my_bookings_all(callback: CallbackQuery):
     await callback.answer()
 
 
+async def cb_my_massage_root(callback: CallbackQuery):
+    with get_session() as session:
+        u = session.scalar(select(User).where(User.tg_id == callback.from_user.id))
+        if not u:
+            await callback.answer("Сначала пройди регистрацию.", show_alert=True)
+            return
+        now = now_naive_local()
+        cnt = session.scalar(
+            select(func.count(Training.id)).where(
+                and_(
+                    Training.user_id == u.id,
+                    Training.service_type == SERVICE_MASSAGE,
+                    Training.status == "scheduled",
+                    Training.start_at >= now,
+                )
+            )
+        )
+        has_upcoming = (cnt or 0) > 0
+
+    body = "Мои текущие массажи:\n\nВыбери день (на неделю вперёд) или нажми «Показать все записи»."
+    if not has_upcoming:
+        body += "\n\n<i>Сейчас нет предстоящих записей.</i>"
+    await callback.message.edit_text(body, reply_markup=build_my_massage_root_keyboard())
+    await callback.answer()
+
+
+async def cb_my_massage_day(callback: CallbackQuery):
+    if not callback.data or not callback.data.startswith("mymassday:"):
+        await callback.answer()
+        return
+    _, iso = callback.data.split(":", 1)
+    try:
+        target_date = date.fromisoformat(iso)
+    except ValueError:
+        await callback.answer("Неверная дата.", show_alert=True)
+        return
+
+    with get_session() as session:
+        u = session.scalar(select(User).where(User.tg_id == callback.from_user.id))
+        if not u:
+            await callback.answer("Сначала пройди регистрацию.", show_alert=True)
+            return
+        stmt = (
+            select(Training)
+            .where(
+                and_(
+                    Training.user_id == u.id,
+                    Training.service_type == SERVICE_MASSAGE,
+                    Training.status == "scheduled",
+                    func.date(Training.start_at) == target_date,
+                )
+            )
+            .order_by(Training.start_at)
+        )
+        items = session.scalars(stmt).all()
+
+    if not items:
+        body = f"Массажи на <b>{target_date.strftime('%d.%m.%Y')}</b>:\n\nНа этот день нет записей."
+    else:
+        lines = [f"Массажи на <b>{target_date.strftime('%d.%m.%Y')}</b>:", ""]
+        for t in items:
+            lines.append(f"• {t.start_at.strftime('%H:%M')} — {status_label(t.status)}")
+        body = "\n".join(lines)
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data=MY_MASS_ROOT)]]
+    )
+    await callback.message.edit_text(body, reply_markup=back_kb)
+    await callback.answer()
+
+
+async def cb_my_massage_all(callback: CallbackQuery):
+    now = now_naive_local()
+    with get_session() as session:
+        u = session.scalar(select(User).where(User.tg_id == callback.from_user.id))
+        if not u:
+            await callback.answer("Сначала пройди регистрацию.", show_alert=True)
+            return
+        stmt = (
+            select(Training)
+            .where(
+                and_(
+                    Training.user_id == u.id,
+                    Training.service_type == SERVICE_MASSAGE,
+                    Training.status == "scheduled",
+                    Training.start_at >= now,
+                )
+            )
+            .order_by(Training.start_at)
+        )
+        items = session.scalars(stmt).all()
+
+    if not items:
+        body = "Все предстоящие массажи:\n\nНет активных записей."
+    else:
+        lines = ["Все предстоящие массажи:", ""]
+        for t in items:
+            lines.append(f"• {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}")
+        body = "\n".join(lines)
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data=MY_MASS_ROOT)]]
+    )
+    await callback.message.edit_text(body, reply_markup=back_kb)
+    await callback.answer()
+
+
 async def cb_calendar_navigation(callback: CallbackQuery):
     if not callback.data:
         return
     _, date_str = callback.data.split(":", 1)
     target_date = date.fromisoformat(date_str)
+    st = user_states.get(callback.from_user.id, {})
+    service_type = st.get("service_type", SERVICE_TRAINING)
+    service_name = "массажа" if service_type == SERVICE_MASSAGE else "тренировки"
     await callback.message.edit_text(
-        f"📅 {calendar_title(target_date)}\n\nВыбери дату для тренировки:",
+        f"📅 {calendar_title(target_date)}\n\nВыбери дату для {service_name}:",
         reply_markup=generate_calendar_keyboard(target_date),
     )
     await callback.answer()
 
 
 async def cb_cancel_booking_flow(callback: CallbackQuery):
-    user_states.pop(callback.from_user.id, None)
-    await callback.message.edit_text("Запись на тренировку отменена.")
+    st = user_states.pop(callback.from_user.id, None) or {}
+    service_type = st.get("service_type", SERVICE_TRAINING)
+    await callback.message.edit_text("Запись отменена.")
     try:
         await callback.bot.send_message(
             chat_id=callback.from_user.id,
-            text="Выбери действие в меню «Тренировки»:",
-            reply_markup=trainings_menu_kb(),
+            text="Выбери действие в меню:",
+            reply_markup=massage_menu_kb() if service_type == SERVICE_MASSAGE else trainings_menu_kb(),
         )
     except Exception:
         pass
@@ -734,8 +997,11 @@ async def cb_cancel_booking_flow(callback: CallbackQuery):
 
 async def cb_back_to_dates(callback: CallbackQuery):
     today = today_local()
+    st = user_states.get(callback.from_user.id, {})
+    service_type = st.get("service_type", SERVICE_TRAINING)
+    service_name = "массажа" if service_type == SERVICE_MASSAGE else "тренировки"
     await callback.message.edit_text(
-        f"📅 {calendar_title(today)}\n\nВыбери дату для тренировки:",
+        f"📅 {calendar_title(today)}\n\nВыбери дату для {service_name}:",
         reply_markup=generate_calendar_keyboard(today),
     )
     await callback.answer()
@@ -749,6 +1015,7 @@ async def cb_select_date(callback: CallbackQuery):
 
     st = user_states.get(callback.from_user.id, {})
     skip_min = st.get("flow") == "admin_reschedule"
+    service_type = st.get("service_type", SERVICE_TRAINING)
 
     with get_session() as session:
         stmt = (
@@ -766,7 +1033,7 @@ async def cb_select_date(callback: CallbackQuery):
     await callback.message.edit_text(
         f"Дата {selected_date.strftime('%d.%m')}. Выбери время:",
         reply_markup=generate_time_keyboard(
-            selected_date, existing_slots, skip_min_advance=skip_min
+            selected_date, existing_slots, service_type=service_type, skip_min_advance=skip_min
         ),
     )
 
@@ -782,14 +1049,14 @@ async def cb_select_time(callback: CallbackQuery):
 
     state = user_states.get(user_id, {})
     flow = state.get("flow")
+    service_type = state.get("service_type", SERVICE_TRAINING)
 
-    min_dt = earliest_bookable_moment()
+    min_dt = earliest_bookable_moment(service_type)
     # Перенос тренером — без ограничения «за час» (срочные правки расписания)
     if flow in ("booking", "client_reschedule"):
         if selected_dt < min_dt:
             await callback.answer(
-                "Запись и перенос возможны только не позднее чем за 1 час до начала слота. "
-                "Выбери другое время.",
+                "Это время недоступно по ограничению минимального времени записи. Выбери другое.",
                 show_alert=True,
             )
             return
@@ -801,40 +1068,59 @@ async def cb_select_time(callback: CallbackQuery):
             return
 
         if flow == "booking":
-            stmt = select(Training).where(
+            day_slots_stmt = select(Training.start_at).where(
                 and_(
                     Training.status == "scheduled",
-                    Training.start_at == selected_dt,
+                    func.date(Training.start_at) == selected_dt.date(),
                 )
             )
-            existing = session.scalar(stmt)
-            if existing:
+            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
+            if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
                 await callback.answer(
                     "Это время уже занято. Выбери другое.", show_alert=True
                 )
                 return
 
-            if user.package_remaining <= 0:
+            remaining = (
+                user.massage_package_remaining
+                if service_type == SERVICE_MASSAGE
+                else user.package_remaining
+            )
+            if remaining <= 0:
                 await callback.answer(
-                    "У тебя нет доступных тренировок. Обратись к тренеру.", show_alert=True
+                    "У тебя нет доступных сеансов. Обратись к тренеру.", show_alert=True
                 )
                 return
 
-            t = Training(user_id=user.id, start_at=selected_dt, status="scheduled")
-            user.package_remaining -= 1
+            t = Training(
+                user_id=user.id,
+                service_type=service_type,
+                start_at=selected_dt,
+                status="scheduled",
+            )
+            if service_type == SERVICE_MASSAGE:
+                user.massage_package_remaining -= 1
+            else:
+                user.package_remaining -= 1
             session.add(t)
             session.commit()
             session.refresh(t)
 
+            rest = (
+                user.massage_package_remaining
+                if service_type == SERVICE_MASSAGE
+                else user.package_remaining
+            )
+            service_noun = "массаж" if service_type == SERVICE_MASSAGE else "тренировку"
             await callback.message.edit_text(
-                f"✅ Ты записан на тренировку {selected_dt.strftime('%d.%m %H:%M')}.\n"
-                f"Осталось тренировок в пакете: {user.package_remaining}",
+                f"✅ Ты записан на {service_noun} {selected_dt.strftime('%d.%m %H:%M')}.\n"
+                f"Осталось в пакете: {rest}",
             )
             try:
                 await callback.bot.send_message(
                     chat_id=user_id,
                     text="Можешь записаться ещё или посмотреть «Мои записи».",
-                    reply_markup=trainings_menu_kb(),
+                    reply_markup=massage_menu_kb() if service_type == SERVICE_MASSAGE else trainings_menu_kb(),
                 )
             except Exception:
                 pass
@@ -842,7 +1128,7 @@ async def cb_select_time(callback: CallbackQuery):
             await callback.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    f"Новая запись на тренировку:\n"
+                    f"Новая запись ({'Массаж' if service_type == SERVICE_MASSAGE else 'Тренировка'}):\n"
                     f"Клиент: @{user.username or user.first_name}\n"
                     f"Время: {t.start_at.strftime('%d.%m %H:%M')}"
                 ),
@@ -855,23 +1141,24 @@ async def cb_select_time(callback: CallbackQuery):
                 await callback.answer("Ошибка состояния переноса.", show_alert=True)
                 return
 
-            stmt_exist = select(Training).where(
+            t = session.get(Training, int(training_id))
+            if not t or t.status != "scheduled":
+                await callback.answer("Запись не найдена или уже изменена.", show_alert=True)
+                return
+            service_type = t.service_type or SERVICE_TRAINING
+
+            day_slots_stmt = select(Training.start_at).where(
                 and_(
                     Training.status == "scheduled",
-                    Training.start_at == selected_dt,
-                    Training.id != int(training_id),
+                    func.date(Training.start_at) == selected_dt.date(),
+                    Training.id != t.id,
                 )
             )
-            existing = session.scalar(stmt_exist)
-            if existing:
+            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
+            if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
                 await callback.answer(
                     "Это время уже занято. Выбери другое.", show_alert=True
                 )
-                return
-
-            t = session.get(Training, int(training_id))
-            if not t or t.status != "scheduled":
-                await callback.answer("Тренировка не найдена или уже изменена.", show_alert=True)
                 return
 
             old_time = t.start_at
@@ -882,7 +1169,7 @@ async def cb_select_time(callback: CallbackQuery):
             session.commit()
 
             await callback.message.edit_text(
-                f"✅ Тренировка перенесена с {old_time.strftime('%d.%m %H:%M')} "
+                f"✅ Запись перенесена с {old_time.strftime('%d.%m %H:%M')} "
                 f"на {t.start_at.strftime('%d.%m %H:%M')}."
             )
             try:
@@ -890,16 +1177,21 @@ async def cb_select_time(callback: CallbackQuery):
                     chat_id=user.tg_id,
                     text=(
                         f"Ты перенёс свою тренировку.\n"
+                        if service_type == SERVICE_TRAINING
+                        else "Ты перенёс свой массаж.\n"
+                    )
+                    + (
                         f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
                     ),
-                    reply_markup=trainings_menu_kb(),
+                    reply_markup=massage_menu_kb() if service_type == SERVICE_MASSAGE else trainings_menu_kb(),
                 )
             except Exception:
                 pass
             await callback.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    f"Клиент @{user.username or user.first_name} перенёс тренировку.\n"
+                    f"Клиент @{user.username or user.first_name} перенёс "
+                    f"{'массаж' if service_type == SERVICE_MASSAGE else 'тренировку'}.\n"
                     f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
                 ),
             )
@@ -912,20 +1204,6 @@ async def cb_select_time(callback: CallbackQuery):
             training_id = state.get("training_id")
             if not training_id:
                 await callback.answer("Ошибка состояния переноса.", show_alert=True)
-                return
-
-            stmt_exist = select(Training).where(
-                and_(
-                    Training.status == "scheduled",
-                    Training.start_at == selected_dt,
-                    Training.id != int(training_id),
-                )
-            )
-            existing = session.scalar(stmt_exist)
-            if existing:
-                await callback.answer(
-                    "Это время уже занято. Выбери другое.", show_alert=True
-                )
                 return
 
             t = session.scalar(
@@ -941,6 +1219,21 @@ async def cb_select_time(callback: CallbackQuery):
             if not t:
                 await callback.answer("Тренировка не найдена или уже изменена.", show_alert=True)
                 return
+            service_type = t.service_type or SERVICE_TRAINING
+
+            day_slots_stmt = select(Training.start_at).where(
+                and_(
+                    Training.status == "scheduled",
+                    func.date(Training.start_at) == selected_dt.date(),
+                    Training.id != t.id,
+                )
+            )
+            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
+            if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
+                await callback.answer(
+                    "Это время уже занято. Выбери другое.", show_alert=True
+                )
+                return
 
             old_time = t.start_at
             client_tg = t.user.tg_id
@@ -955,13 +1248,17 @@ async def cb_select_time(callback: CallbackQuery):
             old_when = old_time.strftime("%d.%m %H:%M")
 
             await callback.message.edit_text(
-                f"Тренировка перенесена с {old_when} на {new_when}."
+                f"Запись перенесена с {old_when} на {new_when}."
             )
 
             await callback.bot.send_message(
                 chat_id=client_tg,
                 text=(
                     f"Твоя тренировка была перенесена тренером.\n"
+                    if service_type == SERVICE_TRAINING
+                    else "Твой массаж был перенесен тренером.\n"
+                )
+                + (
                     f"Новое время: {new_when}"
                 ),
             )
@@ -970,6 +1267,10 @@ async def cb_select_time(callback: CallbackQuery):
                 chat_id=ADMIN_ID,
                 text=(
                     f"Ты перенёс тренировку клиента @{client_uname}\n"
+                    if service_type == SERVICE_TRAINING
+                    else f"Ты перенёс массаж клиента @{client_uname}\n"
+                )
+                + (
                     f"Новое время: {new_when}"
                 ),
             )
@@ -1028,13 +1329,16 @@ async def cb_cancel_my(callback: CallbackQuery):
 
         t.status = "cancelled"
         if refundable:
-            user.package_remaining += 1
+            if (t.service_type or SERVICE_TRAINING) == SERVICE_MASSAGE:
+                user.massage_package_remaining += 1
+            else:
+                user.package_remaining += 1
 
         session.commit()
 
         await callback.message.edit_text(
-            f"❌ Тренировка на {t.start_at.strftime('%d.%m %H:%M')} отменена.\n"
-            + ("Тренировка вернулась в твой пакет." if refundable else "Меньше чем за 4 часа — тренировка сгорает."),
+            f"❌ Запись на {t.start_at.strftime('%d.%m %H:%M')} отменена.\n"
+            + ("Сеанс вернулся в твой пакет." if refundable else "Меньше чем за 4 часа — сеанс сгорает."),
         )
         try:
             await callback.bot.send_message(
@@ -1076,7 +1380,11 @@ async def cb_reschedule_my(callback: CallbackQuery):
             )
             return
 
-    user_states[user_id] = {"flow": "client_reschedule", "training_id": str(training_id)}
+    user_states[user_id] = {
+        "flow": "client_reschedule",
+        "training_id": str(training_id),
+        "service_type": t.service_type or SERVICE_TRAINING,
+    }
 
     today = today_local()
     await callback.message.edit_text(
@@ -1111,7 +1419,7 @@ async def admin_show_clients(message: Message, page: int = 0):
             f"{c.first_name or ''} {c.last_name or ''}".strip()
             or f"@{c.username}" if c.username else f"id{c.tg_id}"
         )
-        label += f" | осталось: {c.package_remaining}"
+        label += f" | тр: {c.package_remaining}, мс: {c.massage_package_remaining}"
         text_lines.append(label)
         builder.button(
             text=label,
@@ -1188,6 +1496,7 @@ async def cb_client_card(callback: CallbackQuery):
         client_line,
         f"📱 Телефон: {client.phone or 'не указан'}",
         f"📦 Пакет: всего {client.package_total}, осталось {client.package_remaining}",
+        f"💆 Массаж: всего {client.massage_package_total}, осталось {client.massage_package_remaining}",
         "",
         "Предстоящие и ожидающие итога:",
     ]
@@ -1208,6 +1517,9 @@ async def cb_client_card(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.button(
         text="Задать пакет", callback_data=f"setpkg:{client.id}"
+    )
+    builder.button(
+        text="Задать пакет (массаж)", callback_data=f"setpkgmass:{client.id}"
     )
     builder.button(
         text="Записи клиента", callback_data=f"client_tr:{client.id}"
@@ -1246,6 +1558,25 @@ async def cb_set_package(callback: CallbackQuery):
     await callback.answer()
 
 
+async def cb_set_massage_package(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    if not callback.data:
+        return
+    _, client_id_str = callback.data.split(":", 1)
+    client_id = int(client_id_str)
+
+    admin_states[callback.from_user.id] = {
+        "action": "set_massage_package",
+        "client_id": str(client_id),
+    }
+
+    await callback.message.edit_text(
+        "Введи количество сеансов массажа для клиента (целое число).\nОтменить: напиши «отмена»."
+    )
+    await callback.answer()
+
+
 async def handle_admin_text(message: Message):
     if not is_channel_admin(message.from_user.id):
         return False
@@ -1253,7 +1584,7 @@ async def handle_admin_text(message: Message):
     if not state:
         return False
 
-    if state.get("action") == "set_package":
+    if state.get("action") in ("set_package", "set_massage_package"):
         client_id = int(state["client_id"])
         if message.text.strip().lower() in ("отмена", "отменить", "cancel"):
             admin_states.pop(message.from_user.id, None)
@@ -1274,12 +1605,19 @@ async def handle_admin_text(message: Message):
                 admin_states.pop(message.from_user.id, None)
                 return True
 
-            diff = value - client.package_total
-            client.package_total = value
-            client.package_remaining = max(client.package_remaining + diff, 0)
+            is_massage = state.get("action") == "set_massage_package"
+            if is_massage:
+                diff = value - client.massage_package_total
+                client.massage_package_total = value
+                client.massage_package_remaining = max(client.massage_package_remaining + diff, 0)
+                pkg_rem = client.massage_package_remaining
+            else:
+                diff = value - client.package_total
+                client.package_total = value
+                client.package_remaining = max(client.package_remaining + diff, 0)
+                pkg_rem = client.package_remaining
             session.commit()
             session.refresh(client)
-            pkg_rem = client.package_remaining
             c_username = client.username
             c_first = client.first_name
 
@@ -1289,7 +1627,8 @@ async def handle_admin_text(message: Message):
         else:
             who = c_first or "клиент (без @username)"
         await message.answer(
-            f"Клиенту {who} задано <b>{value}</b> тренировок.\n"
+            f"Клиенту {who} задано <b>{value}</b> "
+            f"{'сеансов массажа' if state.get('action') == 'set_massage_package' else 'тренировок'}.\n"
             f"В пакете осталось: {pkg_rem}.",
             reply_markup=admin_menu_kb(),
         )
@@ -1427,7 +1766,10 @@ async def cb_admin_cancel_training(callback: CallbackQuery):
         t.status = "cancelled"
         t.canceled_by_admin = True
         if refundable:
-            client.package_remaining += 1
+            if (t.service_type or SERVICE_TRAINING) == SERVICE_MASSAGE:
+                client.massage_package_remaining += 1
+            else:
+                client.package_remaining += 1
 
         session.commit()
 
@@ -1462,7 +1804,15 @@ async def cb_admin_reschedule_training(callback: CallbackQuery):
     training_id = int(training_id_str)
     admin_id = callback.from_user.id
 
-    user_states[admin_id] = {"flow": "admin_reschedule", "training_id": str(training_id)}
+    with get_session() as session:
+        t = session.get(Training, training_id)
+        service_type = (t.service_type if t else SERVICE_TRAINING) or SERVICE_TRAINING
+
+    user_states[admin_id] = {
+        "flow": "admin_reschedule",
+        "training_id": str(training_id),
+        "service_type": service_type,
+    }
 
     today = today_local()
     await callback.message.edit_text(
@@ -1477,31 +1827,46 @@ async def cb_close_msg(callback: CallbackQuery):
     await callback.answer()
 
 
-async def admin_show_all_trainings(message: Message):
+async def admin_show_all_trainings(message: Message, service_type: str = SERVICE_TRAINING):
     with get_session() as session:
         cnt = session.scalar(
-            select(func.count(Training.id)).where(Training.status == "scheduled")
+            select(func.count(Training.id)).where(
+                and_(
+                    Training.status == "scheduled",
+                    Training.service_type == service_type,
+                )
+            )
         )
         has_any = (cnt or 0) > 0
 
     await message.answer(
-        admin_all_bookings_root_text(has_any),
-        reply_markup=build_admin_all_bookings_keyboard(),
+        admin_all_bookings_root_text(has_any, service_type),
+        reply_markup=build_admin_all_bookings_keyboard(service_type),
     )
 
 
 async def cb_admin_all_bookings_root(callback: CallbackQuery):
     if not await reject_unless_admin(callback):
         return
+    service_type = (
+        SERVICE_MASSAGE
+        if callback.data == ADM_MASS_ROOT
+        else SERVICE_TRAINING
+    )
     with get_session() as session:
         cnt = session.scalar(
-            select(func.count(Training.id)).where(Training.status == "scheduled")
+            select(func.count(Training.id)).where(
+                and_(
+                    Training.status == "scheduled",
+                    Training.service_type == service_type,
+                )
+            )
         )
         has_any = (cnt or 0) > 0
 
     await callback.message.edit_text(
-        admin_all_bookings_root_text(has_any),
-        reply_markup=build_admin_all_bookings_keyboard(),
+        admin_all_bookings_root_text(has_any, service_type),
+        reply_markup=build_admin_all_bookings_keyboard(service_type),
     )
     await callback.answer()
 
@@ -1509,9 +1874,12 @@ async def cb_admin_all_bookings_root(callback: CallbackQuery):
 async def cb_admin_all_bookings_day(callback: CallbackQuery):
     if not await reject_unless_admin(callback):
         return
-    if not callback.data or not callback.data.startswith("admtrbookday:"):
+    if not callback.data or not (
+        callback.data.startswith("admtrbookday:") or callback.data.startswith("admmassday:")
+    ):
         await callback.answer()
         return
+    service_type = SERVICE_MASSAGE if callback.data.startswith("admmassday:") else SERVICE_TRAINING
     _, iso = callback.data.split(":", 1)
     try:
         target_date = date.fromisoformat(iso)
@@ -1526,6 +1894,7 @@ async def cb_admin_all_bookings_day(callback: CallbackQuery):
             .where(
                 and_(
                     Training.status == "scheduled",
+                    Training.service_type == service_type,
                     func.date(Training.start_at) == target_date,
                 )
             )
@@ -1552,7 +1921,7 @@ async def cb_admin_all_bookings_day(callback: CallbackQuery):
 
     back_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_ALL_ROOT)]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_MASS_ROOT if service_type == SERVICE_MASSAGE else ADM_ALL_ROOT)]
         ]
     )
     await callback.message.edit_text(body, reply_markup=back_kb)
@@ -1562,6 +1931,7 @@ async def cb_admin_all_bookings_day(callback: CallbackQuery):
 async def cb_admin_all_bookings_all(callback: CallbackQuery):
     if not await reject_unless_admin(callback):
         return
+    service_type = SERVICE_MASSAGE if callback.data == ADM_MASS_ALL else SERVICE_TRAINING
     now = now_naive_local()
     with get_session() as session:
         stmt = (
@@ -1570,6 +1940,7 @@ async def cb_admin_all_bookings_all(callback: CallbackQuery):
             .where(
                 and_(
                     Training.status == "scheduled",
+                    Training.service_type == service_type,
                     Training.start_at >= now,
                 )
             )
@@ -1578,9 +1949,16 @@ async def cb_admin_all_bookings_all(callback: CallbackQuery):
         rows = session.scalars(stmt).all()
 
     if not rows:
-        body = "Все предстоящие записи:\n\nНет активных записей."
+        body = (
+            "Все предстоящие записи (Массаж):\n\nНет активных записей."
+            if service_type == SERVICE_MASSAGE
+            else "Все предстоящие записи (Тренировки):\n\nНет активных записей."
+        )
     else:
-        lines = ["Все предстоящие записи:", ""]
+        lines = [
+            "Все предстоящие записи (Массаж):" if service_type == SERVICE_MASSAGE else "Все предстоящие записи (Тренировки):",
+            "",
+        ]
         for t in rows:
             un = t.user.username or t.user.first_name or "—"
             lines.append(
@@ -1590,7 +1968,7 @@ async def cb_admin_all_bookings_all(callback: CallbackQuery):
 
     back_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_ALL_ROOT)]
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_MASS_ROOT if service_type == SERVICE_MASSAGE else ADM_ALL_ROOT)]
         ]
     )
     await callback.message.edit_text(body, reply_markup=back_kb)
@@ -1674,7 +2052,11 @@ async def cb_training_post_resolve(callback: CallbackQuery):
                 return
             client = session.scalar(select(User).where(User.id == t.user_id))
             t.status = "cancelled"
-            client.package_remaining += 1
+            service_type = (t.service_type or SERVICE_TRAINING)
+            if service_type == SERVICE_MASSAGE:
+                client.massage_package_remaining += 1
+            else:
+                client.package_remaining += 1
             session.commit()
             client_tg = client.tg_id
             when = t.start_at.strftime("%d.%m %H:%M")
@@ -1687,8 +2069,8 @@ async def cb_training_post_resolve(callback: CallbackQuery):
             await callback.bot.send_message(
                 chat_id=client_tg,
                 text=(
-                    f"Тренировка {when} отменена тренером (не состоялась). "
-                    f"Занятие возвращено в твой пакет."
+                    f"Запись {when} отменена тренером (не состоялась). "
+                    f"Сеанс возвращен в твой пакет."
                 ),
             )
         except Exception as e:
@@ -1697,9 +2079,13 @@ async def cb_training_post_resolve(callback: CallbackQuery):
         return
 
     if action == "m":
+        with get_session() as session:
+            t = session.get(Training, tid)
+            service_type = (t.service_type if t else SERVICE_TRAINING) or SERVICE_TRAINING
         user_states[callback.from_user.id] = {
             "flow": "admin_reschedule",
             "training_id": str(tid),
+            "service_type": service_type,
         }
         base = callback.message.text or ""
         await callback.message.edit_text(
@@ -1885,6 +2271,9 @@ async def main():
     async def w_setpkg(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_set_package)
 
+    async def w_setpkg_mass(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_set_massage_package)
+
     async def w_client_tr(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_client_trainings)
 
@@ -1927,6 +2316,15 @@ async def main():
     async def w_mybook_day(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_my_bookings_day)
 
+    async def w_mymass_root(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_my_massage_root)
+
+    async def w_mymass_all(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_my_massage_all)
+
+    async def w_mymass_day(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_my_massage_day)
+
     dp.callback_query.register(w_cal, F.data.startswith("cal:"))
     dp.callback_query.register(w_date, F.data.startswith("date:"))
     dp.callback_query.register(w_time, F.data.startswith("time:"))
@@ -1938,13 +2336,17 @@ async def main():
     dp.callback_query.register(w_clients_page, F.data.startswith("clients_page:"))
     dp.callback_query.register(w_client_card, F.data.startswith("client:"))
     dp.callback_query.register(w_setpkg, F.data.startswith("setpkg:"))
+    dp.callback_query.register(w_setpkg_mass, F.data.startswith("setpkgmass:"))
     dp.callback_query.register(w_client_tr, F.data.startswith("client_tr:"))
     dp.callback_query.register(w_admtr, F.data.startswith("admtr:"))
     dp.callback_query.register(w_admcancel, F.data.startswith("admcancel:"))
     dp.callback_query.register(w_admresch, F.data.startswith("admresch:"))
     dp.callback_query.register(w_adm_all_root, F.data == ADM_ALL_ROOT)
+    dp.callback_query.register(w_adm_all_root, F.data == ADM_MASS_ROOT)
     dp.callback_query.register(w_adm_all_all, F.data == ADM_ALL_ALL)
+    dp.callback_query.register(w_adm_all_all, F.data == ADM_MASS_ALL)
     dp.callback_query.register(w_adm_all_day, F.data.startswith("admtrbookday:"))
+    dp.callback_query.register(w_adm_all_day, F.data.startswith("admmassday:"))
     dp.callback_query.register(w_close, F.data == "close_msg")
     dp.callback_query.register(w_tpy, F.data.startswith("tpy:"))
     dp.callback_query.register(w_tpn, F.data.startswith("tpn:"))
@@ -1952,6 +2354,9 @@ async def main():
     dp.callback_query.register(w_mybook_root, F.data == MY_BOOK_ROOT)
     dp.callback_query.register(w_mybook_all, F.data == MY_BOOK_ALL)
     dp.callback_query.register(w_mybook_day, F.data.startswith("mybookday:"))
+    dp.callback_query.register(w_mymass_root, F.data == MY_MASS_ROOT)
+    dp.callback_query.register(w_mymass_all, F.data == MY_MASS_ALL)
+    dp.callback_query.register(w_mymass_day, F.data.startswith("mymassday:"))
 
     asyncio.create_task(reminders_worker(bot))
 
