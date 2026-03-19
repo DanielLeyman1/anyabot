@@ -107,6 +107,14 @@ class Training(Base):
     user = relationship("User", back_populates="trainings")
 
 
+class BlockedSlot(Base):
+    __tablename__ = "blocked_slots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    start_at = Column(DateTime, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -205,6 +213,7 @@ def admin_menu_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="👥 Клиенты")],
         [KeyboardButton(text="📆 Все записи (Тренировки)")],
         [KeyboardButton(text="📆 Все записи (Массаж)")],
+        [KeyboardButton(text="🔒 Забронировать время")],
         [KeyboardButton(text="⬅️ Назад в меню")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -227,6 +236,8 @@ ADM_ALL_ROOT = "admtrbook:root"
 ADM_ALL_ALL = "admtrbook:all"
 ADM_MASS_ROOT = "admmass:root"
 ADM_MASS_ALL = "admmass:all"
+ADM_BLOCK_ROOT = "admblock:root"
+ADM_BLOCK_ALL = "admblock:all"
 
 
 def admin_all_bookings_root_text(has_any: bool, service_type: str = SERVICE_TRAINING) -> str:
@@ -262,6 +273,59 @@ def build_admin_all_bookings_keyboard(service_type: str = SERVICE_TRAINING) -> I
             callback_data=ADM_MASS_ALL if service_type == SERVICE_MASSAGE else ADM_ALL_ALL,
         )
     )
+    return builder.as_markup()
+
+
+def admin_block_root_text(has_any: bool) -> str:
+    lines = [
+        "🔒 Забронированное время (блокировки):",
+        "",
+        "Выбери день (неделя вперёд) или нажми «Показать все блокировки».",
+        "Заблокированный час скрывается из записи и для тренировок, и для массажа.",
+    ]
+    if not has_any:
+        lines.extend(["", "<i>Пока нет заблокированных слотов.</i>"])
+    return "\n".join(lines)
+
+
+def build_admin_block_root_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    today = today_local()
+    for i in range(7):
+        d = today + timedelta(days=i)
+        wd = WEEKDAYS_SHORT_RU[d.weekday()]
+        builder.button(
+            text=f"{wd} {d.strftime('%d.%m')}",
+            callback_data=f"admblockday:{d.isoformat()}",
+        )
+    builder.adjust(3)
+    builder.row(
+        InlineKeyboardButton(
+            text="📋 Показать все блокировки",
+            callback_data=ADM_BLOCK_ALL,
+        )
+    )
+    return builder.as_markup()
+
+
+def build_admin_block_day_keyboard(
+    selected_date: date,
+    blocked_starts: List[datetime],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    blocked_set = {dt for dt in blocked_starts}
+    dt = datetime.combine(selected_date, time(8, 0))
+    end_dt = datetime.combine(selected_date, time(19, 0))
+    now_dt = now_naive_local()
+    while dt <= end_dt:
+        if dt > now_dt and dt not in blocked_set:
+            builder.button(
+                text=dt.strftime("%H:%M"),
+                callback_data=f"admblocktime:{dt.isoformat()}",
+            )
+        dt += timedelta(hours=1)
+    builder.adjust(4)
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_BLOCK_ROOT))
     return builder.as_markup()
 
 
@@ -336,6 +400,30 @@ def is_slot_available_for_service(
         ):
             return False
     return True
+
+
+def get_busy_slots_for_date(
+    session: Session,
+    selected_date: date,
+    exclude_training_id: Optional[int] = None,
+) -> List[datetime]:
+    trainings_stmt = select(Training.start_at).where(
+        and_(
+            Training.status == "scheduled",
+            func.date(Training.start_at) == selected_date,
+        )
+    )
+    if exclude_training_id is not None:
+        trainings_stmt = trainings_stmt.where(Training.id != exclude_training_id)
+    training_slots = [row[0] for row in session.execute(trainings_stmt).all()]
+
+    blocked_stmt = (
+        select(BlockedSlot.start_at)
+        .where(func.date(BlockedSlot.start_at) == selected_date)
+        .order_by(BlockedSlot.start_at)
+    )
+    blocked_slots = [row[0] for row in session.execute(blocked_stmt).all()]
+    return training_slots + blocked_slots
 
 
 def generate_time_keyboard(
@@ -548,6 +636,10 @@ async def handle_main_menu(message: Message):
         message.from_user.id
     ):
         await admin_show_all_trainings(message, SERVICE_MASSAGE)
+    elif text == "🔒 Забронировать время" and user.is_admin and is_channel_admin(
+        message.from_user.id
+    ):
+        await admin_show_blocked_slots(message)
     else:
         await message.answer(
             "Не понял команду. Используй кнопки меню ниже.",
@@ -1018,17 +1110,7 @@ async def cb_select_date(callback: CallbackQuery):
     service_type = st.get("service_type", SERVICE_TRAINING)
 
     with get_session() as session:
-        stmt = (
-            select(Training.start_at)
-            .where(
-                and_(
-                    Training.status == "scheduled",
-                    func.date(Training.start_at) == selected_date,
-                )
-            )
-            .order_by(Training.start_at)
-        )
-        existing_slots = [row[0] for row in session.execute(stmt).all()]
+        existing_slots = get_busy_slots_for_date(session, selected_date)
 
     await callback.message.edit_text(
         f"Дата {selected_date.strftime('%d.%m')}. Выбери время:",
@@ -1068,13 +1150,7 @@ async def cb_select_time(callback: CallbackQuery):
             return
 
         if flow == "booking":
-            day_slots_stmt = select(Training.start_at).where(
-                and_(
-                    Training.status == "scheduled",
-                    func.date(Training.start_at) == selected_dt.date(),
-                )
-            )
-            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
+            existing_slots = get_busy_slots_for_date(session, selected_dt.date())
             if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
                 await callback.answer(
                     "Это время уже занято. Выбери другое.", show_alert=True
@@ -1147,14 +1223,11 @@ async def cb_select_time(callback: CallbackQuery):
                 return
             service_type = t.service_type or SERVICE_TRAINING
 
-            day_slots_stmt = select(Training.start_at).where(
-                and_(
-                    Training.status == "scheduled",
-                    func.date(Training.start_at) == selected_dt.date(),
-                    Training.id != t.id,
-                )
+            existing_slots = get_busy_slots_for_date(
+                session,
+                selected_dt.date(),
+                exclude_training_id=t.id,
             )
-            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
             if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
                 await callback.answer(
                     "Это время уже занято. Выбери другое.", show_alert=True
@@ -1221,14 +1294,11 @@ async def cb_select_time(callback: CallbackQuery):
                 return
             service_type = t.service_type or SERVICE_TRAINING
 
-            day_slots_stmt = select(Training.start_at).where(
-                and_(
-                    Training.status == "scheduled",
-                    func.date(Training.start_at) == selected_dt.date(),
-                    Training.id != t.id,
-                )
+            existing_slots = get_busy_slots_for_date(
+                session,
+                selected_dt.date(),
+                exclude_training_id=t.id,
             )
-            existing_slots = [row[0] for row in session.execute(day_slots_stmt).all()]
             if not is_slot_available_for_service(selected_dt, existing_slots, service_type):
                 await callback.answer(
                     "Это время уже занято. Выбери другое.", show_alert=True
@@ -1845,6 +1915,175 @@ async def admin_show_all_trainings(message: Message, service_type: str = SERVICE
     )
 
 
+async def admin_show_blocked_slots(message: Message):
+    now = now_naive_local()
+    with get_session() as session:
+        cnt = session.scalar(
+            select(func.count(BlockedSlot.id)).where(BlockedSlot.start_at >= now)
+        )
+        has_any = (cnt or 0) > 0
+    await message.answer(
+        admin_block_root_text(has_any),
+        reply_markup=build_admin_block_root_keyboard(),
+    )
+
+
+async def cb_admin_block_root(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    now = now_naive_local()
+    with get_session() as session:
+        cnt = session.scalar(
+            select(func.count(BlockedSlot.id)).where(BlockedSlot.start_at >= now)
+        )
+        has_any = (cnt or 0) > 0
+    await callback.message.edit_text(
+        admin_block_root_text(has_any),
+        reply_markup=build_admin_block_root_keyboard(),
+    )
+    await callback.answer()
+
+
+async def cb_admin_block_day(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    if not callback.data or not callback.data.startswith("admblockday:"):
+        await callback.answer()
+        return
+    _, iso = callback.data.split(":", 1)
+    try:
+        target_date = date.fromisoformat(iso)
+    except ValueError:
+        await callback.answer("Неверная дата.", show_alert=True)
+        return
+
+    with get_session() as session:
+        blocked_stmt = (
+            select(BlockedSlot.start_at)
+            .where(func.date(BlockedSlot.start_at) == target_date)
+            .order_by(BlockedSlot.start_at)
+        )
+        blocked_starts = [row[0] for row in session.execute(blocked_stmt).all()]
+
+    if blocked_starts:
+        lines = [f"Блокировки на <b>{target_date.strftime('%d.%m.%Y')}</b>:", ""]
+        for dt in blocked_starts:
+            lines.append(f"• {dt.strftime('%H:%M')} — забронировано тренером")
+        lines.append("")
+        lines.append("Выбери новый час для блокировки:")
+        body = "\n".join(lines)
+    else:
+        body = (
+            f"Блокировки на <b>{target_date.strftime('%d.%m.%Y')}</b>:\n\n"
+            "Пока блокировок нет.\n\n"
+            "Выбери час для блокировки:"
+        )
+
+    await callback.message.edit_text(
+        body,
+        reply_markup=build_admin_block_day_keyboard(target_date, blocked_starts),
+    )
+    await callback.answer()
+
+
+async def cb_admin_block_all(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    now = now_naive_local()
+    with get_session() as session:
+        rows = session.scalars(
+            select(BlockedSlot)
+            .where(BlockedSlot.start_at >= now)
+            .order_by(BlockedSlot.start_at)
+        ).all()
+    if not rows:
+        body = "Все предстоящие блокировки:\n\nНет активных блокировок."
+    else:
+        lines = ["Все предстоящие блокировки:", ""]
+        for b in rows:
+            lines.append(f"• {b.start_at.strftime('%d.%m %H:%M')}")
+        body = "\n".join(lines)
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_BLOCK_ROOT)]
+        ]
+    )
+    await callback.message.edit_text(body, reply_markup=back_kb)
+    await callback.answer()
+
+
+async def cb_admin_block_time(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    if not callback.data or not callback.data.startswith("admblocktime:"):
+        await callback.answer()
+        return
+    _, dt_s = callback.data.split(":", 1)
+    try:
+        selected_dt = datetime.fromisoformat(dt_s)
+    except ValueError:
+        await callback.answer("Неверный формат времени.", show_alert=True)
+        return
+
+    if selected_dt <= now_naive_local():
+        await callback.answer("Нельзя блокировать прошедшее время.", show_alert=True)
+        return
+
+    with get_session() as session:
+        exists = session.scalar(
+            select(BlockedSlot).where(BlockedSlot.start_at == selected_dt)
+        )
+        if exists:
+            await callback.answer("Этот час уже заблокирован.", show_alert=True)
+            return
+
+        day_training_slots = [
+            row[0]
+            for row in session.execute(
+                select(Training.start_at).where(
+                    and_(
+                        Training.status == "scheduled",
+                        func.date(Training.start_at) == selected_dt.date(),
+                    )
+                )
+            ).all()
+        ]
+        if not is_slot_available_for_service(selected_dt, day_training_slots, SERVICE_TRAINING):
+            await callback.answer(
+                "На это время уже есть запись клиента. Выбери другой час.",
+                show_alert=True,
+            )
+            return
+
+        session.add(BlockedSlot(start_at=selected_dt))
+        session.commit()
+
+        blocked_stmt = (
+            select(BlockedSlot.start_at)
+            .where(func.date(BlockedSlot.start_at) == selected_dt.date())
+            .order_by(BlockedSlot.start_at)
+        )
+        blocked_starts = [row[0] for row in session.execute(blocked_stmt).all()]
+
+    lines = [
+        f"✅ Час <b>{selected_dt.strftime('%d.%m %H:%M')}</b> забронирован тренером.",
+        "",
+        "Этот слот скрыт из записи для тренировок и массажа.",
+        "",
+        f"Блокировки на <b>{selected_dt.strftime('%d.%m.%Y')}</b>:",
+        "",
+    ]
+    for dt in blocked_starts:
+        lines.append(f"• {dt.strftime('%H:%M')} — забронировано тренером")
+    lines.append("")
+    lines.append("Выбери еще час для блокировки:")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=build_admin_block_day_keyboard(selected_dt.date(), blocked_starts),
+    )
+    await callback.answer("Слот заблокирован.")
+
+
 async def cb_admin_all_bookings_root(callback: CallbackQuery):
     if not await reject_unless_admin(callback):
         return
@@ -2295,6 +2534,18 @@ async def main():
     async def w_adm_all_day(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_admin_all_bookings_day)
 
+    async def w_adm_block_root(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_block_root)
+
+    async def w_adm_block_day(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_block_day)
+
+    async def w_adm_block_all(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_block_all)
+
+    async def w_adm_block_time(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_block_time)
+
     async def w_close(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_close_msg)
 
@@ -2347,6 +2598,10 @@ async def main():
     dp.callback_query.register(w_adm_all_all, F.data == ADM_MASS_ALL)
     dp.callback_query.register(w_adm_all_day, F.data.startswith("admtrbookday:"))
     dp.callback_query.register(w_adm_all_day, F.data.startswith("admmassday:"))
+    dp.callback_query.register(w_adm_block_root, F.data == ADM_BLOCK_ROOT)
+    dp.callback_query.register(w_adm_block_all, F.data == ADM_BLOCK_ALL)
+    dp.callback_query.register(w_adm_block_day, F.data.startswith("admblockday:"))
+    dp.callback_query.register(w_adm_block_time, F.data.startswith("admblocktime:"))
     dp.callback_query.register(w_close, F.data == "close_msg")
     dp.callback_query.register(w_tpy, F.data.startswith("tpy:"))
     dp.callback_query.register(w_tpn, F.data.startswith("tpn:"))
