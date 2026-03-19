@@ -26,9 +26,11 @@ from sqlalchemy import (
     ForeignKey,
     select,
     and_,
+    or_,
     func,
+    text,
 )
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session, selectinload
 
 
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +39,9 @@ API_TOKEN = "7348147274:AAEqXWiK10yRvk36Pe3xtWuNl_ac_FqSMqc"
 ADMIN_ID = 1652603985
 
 DATABASE_URL = "sqlite:///booking_bot.db"
+
+# Минимум за сколько до начала слота можно записаться / перенести (новое время)
+BOOKING_MIN_ADVANCE = timedelta(hours=1)
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 Base = declarative_base()
@@ -72,11 +77,29 @@ class Training(Base):
     reminder_client_sent = Column(Boolean, default=False)
     reminder_admin_sent = Column(Boolean, default=False)
     canceled_by_admin = Column(Boolean, default=False)
+    # Уведомление админу «прошла ли тренировка?» уже отправлено
+    post_session_prompt_sent = Column(Boolean, default=False)
 
     user = relationship("User", back_populates="trainings")
 
 
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_db_columns():
+    """Добавить колонки в существующую SQLite-БД (create_all не меняет старые таблицы)."""
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(trainings)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "post_session_prompt_sent" not in col_names:
+            conn.execute(
+                text(
+                    "ALTER TABLE trainings ADD COLUMN post_session_prompt_sent BOOLEAN DEFAULT 0"
+                )
+            )
+
+
+ensure_db_columns()
 
 
 def get_session() -> Session:
@@ -164,6 +187,11 @@ def generate_calendar_keyboard(current_date: date) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def earliest_bookable_moment() -> datetime:
+    """Слот доступен только если до его начала не меньше BOOKING_MIN_ADVANCE."""
+    return datetime.now() + BOOKING_MIN_ADVANCE
+
+
 def generate_time_keyboard(selected_date: date, existing_slots: List[datetime]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
@@ -173,10 +201,16 @@ def generate_time_keyboard(selected_date: date, existing_slots: List[datetime]) 
     occupied_times = {dt.time() for dt in existing_slots}
 
     current_datetime = datetime.now()
+    min_slot_start = earliest_bookable_moment()
 
     dt = datetime.combine(selected_date, start_time)
     while dt.time() <= end_time:
         if selected_date == current_datetime.date() and dt <= current_datetime:
+            dt += timedelta(minutes=15)
+            continue
+
+        # Нельзя записаться «впритык»: минимум за час до начала
+        if dt < min_slot_start:
             dt += timedelta(minutes=15)
             continue
 
@@ -352,7 +386,9 @@ async def start_booking_flow(message: Message, user: User):
 
     today = date.today()
     await message.answer(
-        f"📅 {calendar_title(today)}\n\nВыбери дату для тренировки:",
+        f"📅 {calendar_title(today)}\n\n"
+        f"Выбери дату для тренировки.\n"
+        f"⏱ Запись только не позднее чем за <b>1 час</b> до начала слота.",
         reply_markup=generate_calendar_keyboard(today),
     )
 
@@ -395,13 +431,15 @@ async def start_cancel_reschedule_flow(message: Message, user: User):
 
 
 async def send_my_bookings(message: Message, user: User):
+    now = datetime.now()
     with get_session() as session:
         stmt = (
             select(Training)
             .where(
                 and_(
                     Training.user_id == user.id,
-                    Training.start_at >= datetime.now() - timedelta(days=1),
+                    Training.status == "scheduled",
+                    Training.start_at >= now,
                 )
             )
             .order_by(Training.start_at)
@@ -410,23 +448,19 @@ async def send_my_bookings(message: Message, user: User):
 
     if not trainings:
         await message.answer(
-            "У тебя пока нет записей. Записаться можно через кнопку «Записаться на тренировку».",
+            "У тебя нет предстоящих записей. Записаться можно через «Записаться на тренировку».",
             reply_markup=trainings_menu_kb(),
         )
         return
 
     lines = []
     for t in trainings:
-        status_emoji = {
-            "scheduled": "✅",
-            "cancelled": "❌",
-            "completed": "🏁",
-            "missed": "⚠️",
-        }.get(t.status, "")
-        lines.append(f"{status_emoji} {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}")
+        lines.append(
+            f"✅ {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}"
+        )
 
     await message.answer(
-        "Твои записи (активные и недавние):\n\n" + "\n".join(lines),
+        "Твои предстоящие записи:\n\n" + "\n".join(lines),
         reply_markup=trainings_menu_kb(),
     )
 
@@ -502,6 +536,16 @@ async def cb_select_time(callback: CallbackQuery):
 
     state = user_states.get(user_id, {})
     flow = state.get("flow")
+
+    min_dt = earliest_bookable_moment()
+    if flow in ("booking", "client_reschedule", "admin_reschedule"):
+        if selected_dt < min_dt:
+            await callback.answer(
+                "Запись и перенос возможны только не позднее чем за 1 час до начала слота. "
+                "Выбери другое время.",
+                show_alert=True,
+            )
+            return
 
     with get_session() as session:
         user = session.scalar(select(User).where(User.tg_id == user_id))
@@ -585,6 +629,9 @@ async def cb_select_time(callback: CallbackQuery):
 
             old_time = t.start_at
             t.start_at = selected_dt
+            t.post_session_prompt_sent = False
+            t.reminder_client_sent = False
+            t.reminder_admin_sent = False
             session.commit()
 
             await callback.message.edit_text(
@@ -638,6 +685,9 @@ async def cb_select_time(callback: CallbackQuery):
 
             old_time = t.start_at
             t.start_at = selected_dt
+            t.post_session_prompt_sent = False
+            t.reminder_client_sent = False
+            t.reminder_admin_sent = False
             session.commit()
 
             await callback.message.edit_text(
@@ -855,7 +905,7 @@ async def cb_client_card(callback: CallbackQuery):
             .where(
                 and_(
                     Training.user_id == client.id,
-                    Training.start_at >= datetime.now() - timedelta(days=1),
+                    Training.status == "scheduled",
                 )
             )
             .order_by(Training.start_at)
@@ -870,15 +920,21 @@ async def cb_client_card(callback: CallbackQuery):
         f"📱 Телефон: {client.phone or 'не указан'}",
         f"📦 Пакет: всего {client.package_total}, осталось {client.package_remaining}",
         "",
-        "Ближайшие тренировки:",
+        "Предстоящие и ожидающие итога:",
     ]
     if trainings:
+        now = datetime.now()
         for t in trainings[:10]:
-            caption_lines.append(
-                f"• {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}"
-            )
+            if t.start_at < now:
+                caption_lines.append(
+                    f"• {t.start_at.strftime('%d.%m %H:%M')} — ⏳ ждёт твоего ответа (прошла ли)"
+                )
+            else:
+                caption_lines.append(
+                    f"• {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)}"
+                )
     else:
-        caption_lines.append("— нет записей")
+        caption_lines.append("— нет активных записей")
 
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -977,7 +1033,7 @@ async def cb_client_trainings(callback: CallbackQuery):
             .where(
                 and_(
                     Training.user_id == client.id,
-                    Training.start_at >= datetime.now() - timedelta(days=1),
+                    Training.status == "scheduled",
                 )
             )
             .order_by(Training.start_at)
@@ -985,7 +1041,7 @@ async def cb_client_trainings(callback: CallbackQuery):
         trainings = session.scalars(stmt).all()
 
     if not trainings:
-        await callback.message.edit_text("У клиента нет записей.")
+        await callback.message.edit_text("У клиента нет активных записей.")
         await callback.answer()
         return
 
@@ -1169,6 +1225,129 @@ async def cb_all_trainings_page(callback: CallbackQuery):
     await callback.answer()
 
 
+async def cb_training_passed_yes(callback: CallbackQuery):
+    """Админ подтвердил: тренировка прошла."""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer()
+        return
+    _, tid_s = callback.data.split(":", 1)
+    tid = int(tid_s)
+    with get_session() as session:
+        t = session.get(Training, tid)
+        if not t or t.status != "scheduled":
+            await callback.answer("Запись уже обработана.", show_alert=True)
+            return
+        t.status = "completed"
+        session.commit()
+    base = callback.message.text or ""
+    await callback.message.edit_text(
+        base + "\n\n✅ Отмечено: тренировка прошла.",
+        reply_markup=None,
+    )
+    await callback.answer()
+
+
+async def cb_training_passed_no(callback: CallbackQuery):
+    """Админ: тренировка не прошла — выбор отмены с возвратом или переноса."""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer()
+        return
+    _, tid_s = callback.data.split(":", 1)
+    tid = int(tid_s)
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="↩️ Отменить и вернуть в пакет",
+        callback_data=f"tpr:{tid}:c",
+    )
+    builder.button(
+        text="📅 Перенести",
+        callback_data=f"tpr:{tid}:m",
+    )
+    builder.adjust(1)
+    base = callback.message.text or ""
+    await callback.message.edit_text(
+        base + "\n\nТренировка не состоялась. Что сделать?",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+async def cb_training_post_resolve(callback: CallbackQuery):
+    """tpr:ID:c — отмена с возвратом; tpr:ID:m — перенос."""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not callback.data:
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[0] != "tpr":
+        await callback.answer()
+        return
+    tid = int(parts[1])
+    action = parts[2]
+    today = date.today()
+
+    if action == "c":
+        with get_session() as session:
+            t = session.get(Training, tid)
+            if not t or t.status != "scheduled":
+                await callback.answer("Уже обработано.", show_alert=True)
+                return
+            client = session.scalar(select(User).where(User.id == t.user_id))
+            t.status = "cancelled"
+            client.package_remaining += 1
+            session.commit()
+            client_tg = client.tg_id
+            when = t.start_at.strftime("%d.%m %H:%M")
+        base = callback.message.text or ""
+        await callback.message.edit_text(
+            base + "\n\n↩️ Запись отменена, занятие возвращено в пакет клиента.",
+            reply_markup=None,
+        )
+        try:
+            await callback.bot.send_message(
+                chat_id=client_tg,
+                text=(
+                    f"Тренировка {when} отменена тренером (не состоялась). "
+                    f"Занятие возвращено в твой пакет."
+                ),
+            )
+        except Exception as e:
+            logging.exception(f"Notify client cancel: {e}")
+        await callback.answer()
+        return
+
+    if action == "m":
+        user_states[callback.from_user.id] = {
+            "flow": "admin_reschedule",
+            "training_id": str(tid),
+        }
+        base = callback.message.text or ""
+        await callback.message.edit_text(
+            base + "\n\n📅 Перенос: выбери дату в новом сообщении.",
+            reply_markup=None,
+        )
+        await callback.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"📅 {calendar_title(today)}\n\n"
+                f"Выбери новую дату для переноса тренировки #{tid}:"
+            ),
+            reply_markup=generate_calendar_keyboard(today),
+        )
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+
 async def reminders_worker(bot: Bot):
     while True:
         now = datetime.now()
@@ -1211,6 +1390,43 @@ async def reminders_worker(bot: Bot):
                         t.reminder_admin_sent = True
                     except Exception as e:
                         logging.exception(f"Failed to send admin reminder: {e}")
+
+            # Через 1 час после начала слота — спросить админа, прошла ли тренировка
+            follow_cutoff = now - timedelta(hours=1)
+            stmt_follow = (
+                select(Training)
+                .options(selectinload(Training.user))
+                .where(
+                    and_(
+                        Training.status == "scheduled",
+                        Training.start_at <= follow_cutoff,
+                        or_(
+                            Training.post_session_prompt_sent == False,
+                            Training.post_session_prompt_sent.is_(None),
+                        ),
+                    )
+                )
+            )
+            for t in session.scalars(stmt_follow).all():
+                try:
+                    u = t.user
+                    uname = u.username or u.first_name or "клиент"
+                    fb = InlineKeyboardBuilder()
+                    fb.button(text="✅ Да, прошла", callback_data=f"tpy:{t.id}")
+                    fb.button(text="❌ Нет", callback_data=f"tpn:{t.id}")
+                    fb.adjust(2)
+                    await bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            f"⏱ Тренировка {t.start_at.strftime('%d.%m %H:%M')} "
+                            f"с @{uname} уже должна была начаться (прошёл час).\n\n"
+                            f"Она прошла?"
+                        ),
+                        reply_markup=fb.as_markup(),
+                    )
+                    t.post_session_prompt_sent = True
+                except Exception as e:
+                    logging.exception(f"Failed post-training follow-up: {e}")
 
             session.commit()
 
@@ -1258,78 +1474,87 @@ async def main():
             except Exception:
                 pass
 
-    # Обёртки для callback-хендлеров
-    dp.callback_query.register(
-        lambda c, h=cb_calendar_navigation: safe_callback_wrapper(c, h),
-        F.data.startswith("cal:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_select_date: safe_callback_wrapper(c, h),
-        F.data.startswith("date:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_select_time: safe_callback_wrapper(c, h),
-        F.data.startswith("time:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_cancel_booking_flow: safe_callback_wrapper(c, h),
-        F.data == "cancel_booking_flow",
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_back_to_dates: safe_callback_wrapper(c, h),
-        F.data == "back_to_dates",
-    )
+    # Aiogram передаёт в хендлеры доп. kwargs — лямбды с 2 аргументами ломали callback (бот «висел»).
+    async def w_cal(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_calendar_navigation)
 
-    dp.callback_query.register(
-        lambda c, h=cb_edit_my: safe_callback_wrapper(c, h),
-        F.data.startswith("edit_my:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_cancel_my: safe_callback_wrapper(c, h),
-        F.data.startswith("cancel_my:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_reschedule_my: safe_callback_wrapper(c, h),
-        F.data.startswith("reschedule_my:"),
-    )
+    async def w_date(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_select_date)
 
-    dp.callback_query.register(
-        lambda c, h=cb_clients_page: safe_callback_wrapper(c, h),
-        F.data.startswith("clients_page:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_client_card: safe_callback_wrapper(c, h),
-        F.data.startswith("client:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_set_package: safe_callback_wrapper(c, h),
-        F.data.startswith("setpkg:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_client_trainings: safe_callback_wrapper(c, h),
-        F.data.startswith("client_tr:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_admin_training: safe_callback_wrapper(c, h),
-        F.data.startswith("admtr:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_admin_cancel_training: safe_callback_wrapper(c, h),
-        F.data.startswith("admcancel:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_admin_reschedule_training: safe_callback_wrapper(c, h),
-        F.data.startswith("admresch:"),
-    )
+    async def w_time(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_select_time)
 
-    dp.callback_query.register(
-        lambda c, h=cb_all_trainings_page: safe_callback_wrapper(c, h),
-        F.data.startswith("alltr_page:"),
-    )
-    dp.callback_query.register(
-        lambda c, h=cb_close_msg: safe_callback_wrapper(c, h),
-        F.data == "close_msg",
-    )
+    async def w_cancel_flow(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_cancel_booking_flow)
+
+    async def w_back_dates(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_back_to_dates)
+
+    async def w_edit_my(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_edit_my)
+
+    async def w_cancel_my(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_cancel_my)
+
+    async def w_resched_my(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_reschedule_my)
+
+    async def w_clients_page(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_clients_page)
+
+    async def w_client_card(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_client_card)
+
+    async def w_setpkg(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_set_package)
+
+    async def w_client_tr(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_client_trainings)
+
+    async def w_admtr(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_training)
+
+    async def w_admcancel(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_cancel_training)
+
+    async def w_admresch(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_reschedule_training)
+
+    async def w_alltr_page(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_all_trainings_page)
+
+    async def w_close(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_close_msg)
+
+    async def w_tpy(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_training_passed_yes)
+
+    async def w_tpn(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_training_passed_no)
+
+    async def w_tpr(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_training_post_resolve)
+
+    dp.callback_query.register(w_cal, F.data.startswith("cal:"))
+    dp.callback_query.register(w_date, F.data.startswith("date:"))
+    dp.callback_query.register(w_time, F.data.startswith("time:"))
+    dp.callback_query.register(w_cancel_flow, F.data == "cancel_booking_flow")
+    dp.callback_query.register(w_back_dates, F.data == "back_to_dates")
+    dp.callback_query.register(w_edit_my, F.data.startswith("edit_my:"))
+    dp.callback_query.register(w_cancel_my, F.data.startswith("cancel_my:"))
+    dp.callback_query.register(w_resched_my, F.data.startswith("reschedule_my:"))
+    dp.callback_query.register(w_clients_page, F.data.startswith("clients_page:"))
+    dp.callback_query.register(w_client_card, F.data.startswith("client:"))
+    dp.callback_query.register(w_setpkg, F.data.startswith("setpkg:"))
+    dp.callback_query.register(w_client_tr, F.data.startswith("client_tr:"))
+    dp.callback_query.register(w_admtr, F.data.startswith("admtr:"))
+    dp.callback_query.register(w_admcancel, F.data.startswith("admcancel:"))
+    dp.callback_query.register(w_admresch, F.data.startswith("admresch:"))
+    dp.callback_query.register(w_alltr_page, F.data.startswith("alltr_page:"))
+    dp.callback_query.register(w_close, F.data == "close_msg")
+    dp.callback_query.register(w_tpy, F.data.startswith("tpy:"))
+    dp.callback_query.register(w_tpn, F.data.startswith("tpn:"))
+    dp.callback_query.register(w_tpr, F.data.startswith("tpr:"))
 
     asyncio.create_task(reminders_worker(bot))
 
