@@ -3,6 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, time, date
 from typing import Optional, List, Dict
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -43,6 +44,19 @@ DATABASE_URL = "sqlite:///booking_bot.db"
 
 # Минимум за сколько до начала слота можно записаться / перенести (новое время)
 BOOKING_MIN_ADVANCE = timedelta(hours=1)
+
+# Часовой пояс расписания (слоты и «сейчас» для записи)
+APP_TZ = ZoneInfo("Asia/Yekaterinburg")
+
+
+def now_naive_local() -> datetime:
+    """Текущее локальное время без tzinfo (как в БД для слотов)."""
+    return datetime.now(APP_TZ).replace(tzinfo=None, microsecond=0)
+
+
+def today_local() -> date:
+    return datetime.now(APP_TZ).date()
+
 
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 Base = declarative_base()
@@ -162,6 +176,41 @@ WEEKDAYS_SHORT_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 MY_BOOK_ROOT = "mybook:root"
 MY_BOOK_ALL = "mybook:all"
 
+# Админ: «Все записи» — тот же UX, что «Мои записи» у клиента
+ADM_ALL_ROOT = "admtrbook:root"
+ADM_ALL_ALL = "admtrbook:all"
+
+
+def admin_all_bookings_root_text(has_any: bool) -> str:
+    lines = [
+        "Все текущие записи:",
+        "",
+        "Выбери день (неделя вперёд) или нажми «Показать все записи».",
+    ]
+    if not has_any:
+        lines.extend(["", "<i>Активных записей пока нет.</i>"])
+    return "\n".join(lines)
+
+
+def build_admin_all_bookings_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    today = today_local()
+    for i in range(7):
+        d = today + timedelta(days=i)
+        wd = WEEKDAYS_SHORT_RU[d.weekday()]
+        builder.button(
+            text=f"{wd} {d.strftime('%d.%m')}",
+            callback_data=f"admtrbookday:{d.isoformat()}",
+        )
+    builder.adjust(3)
+    builder.row(
+        InlineKeyboardButton(
+            text="📋 Показать все записи",
+            callback_data=ADM_ALL_ALL,
+        )
+    )
+    return builder.as_markup()
+
 
 def calendar_title(current_date: date) -> str:
     """Заголовок для календаря: месяц и год."""
@@ -169,7 +218,7 @@ def calendar_title(current_date: date) -> str:
 
 
 def generate_calendar_keyboard(current_date: date) -> InlineKeyboardMarkup:
-    today = date.today()
+    today = today_local()
     end_date = today + timedelta(days=14)
 
     builder = InlineKeyboardBuilder()
@@ -210,8 +259,8 @@ def generate_calendar_keyboard(current_date: date) -> InlineKeyboardMarkup:
 
 
 def earliest_bookable_moment() -> datetime:
-    """Слот доступен только если до его начала не меньше BOOKING_MIN_ADVANCE."""
-    return datetime.now() + BOOKING_MIN_ADVANCE
+    """Слот доступен только если до его начала не меньше BOOKING_MIN_ADVANCE (локальное время)."""
+    return now_naive_local() + BOOKING_MIN_ADVANCE
 
 
 def generate_time_keyboard(
@@ -226,12 +275,13 @@ def generate_time_keyboard(
 
     occupied_times = {dt.time() for dt in existing_slots}
 
-    current_datetime = datetime.now()
+    current_datetime = now_naive_local()
     min_slot_start = earliest_bookable_moment()
 
     dt = datetime.combine(selected_date, start_time)
     while dt.time() <= end_time:
-        if selected_date == current_datetime.date() and dt <= current_datetime:
+        # Не показывать уже прошедшие слоты в выбранный календарный день (по Asia/Yekaterinburg)
+        if dt <= current_datetime:
             dt += timedelta(minutes=15)
             continue
 
@@ -404,7 +454,7 @@ async def handle_main_menu(message: Message):
     elif text == "📆 Все записи" and user.is_admin and is_channel_admin(
         message.from_user.id
     ):
-        await admin_show_all_trainings(message, page=0)
+        await admin_show_all_trainings(message)
     else:
         await message.answer(
             "Не понял команду. Используй кнопки меню ниже.",
@@ -438,7 +488,7 @@ async def start_booking_flow(message: Message, user: User):
 
     user_states[message.from_user.id] = {"flow": "booking"}
 
-    today = date.today()
+    today = today_local()
     await message.answer(
         f"📅 {calendar_title(today)}\n\n"
         f"Выбери дату для тренировки.\n"
@@ -460,7 +510,7 @@ def my_bookings_root_text(has_upcoming: bool) -> str:
 
 def build_my_bookings_root_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    today = date.today()
+    today = today_local()
     for i in range(7):
         d = today + timedelta(days=i)
         wd = WEEKDAYS_SHORT_RU[d.weekday()]
@@ -486,7 +536,7 @@ async def start_cancel_reschedule_flow(message: Message, user: User):
                 and_(
                     Training.user_id == user.id,
                     Training.status == "scheduled",
-                    Training.start_at >= datetime.now(),
+                    Training.start_at >= now_naive_local(),
                 )
             )
             .order_by(Training.start_at)
@@ -516,7 +566,7 @@ async def start_cancel_reschedule_flow(message: Message, user: User):
 
 
 async def send_my_bookings(message: Message, user: User):
-    now = datetime.now()
+    now = now_naive_local()
     with get_session() as session:
         cnt = session.scalar(
             select(func.count(Training.id)).where(
@@ -542,7 +592,7 @@ async def cb_my_bookings_root(callback: CallbackQuery):
         if not u:
             await callback.answer("Сначала пройди регистрацию.", show_alert=True)
             return
-        now = datetime.now()
+        now = now_naive_local()
         cnt = session.scalar(
             select(func.count(Training.id)).where(
                 and_(
@@ -618,7 +668,7 @@ async def cb_my_bookings_day(callback: CallbackQuery):
 
 async def cb_my_bookings_all(callback: CallbackQuery):
     """Все предстоящие записи."""
-    now = datetime.now()
+    now = now_naive_local()
     with get_session() as session:
         u = session.scalar(select(User).where(User.tg_id == callback.from_user.id))
         if not u:
@@ -683,7 +733,7 @@ async def cb_cancel_booking_flow(callback: CallbackQuery):
 
 
 async def cb_back_to_dates(callback: CallbackQuery):
-    today = date.today()
+    today = today_local()
     await callback.message.edit_text(
         f"📅 {calendar_title(today)}\n\nВыбери дату для тренировки:",
         reply_markup=generate_calendar_keyboard(today),
@@ -963,7 +1013,7 @@ async def cb_cancel_my(callback: CallbackQuery):
     training_id = int(training_id_str)
     user_tg_id = callback.from_user.id
 
-    now = datetime.now()
+    now = now_naive_local()
 
     with get_session() as session:
         t = session.get(Training, training_id)
@@ -1019,7 +1069,7 @@ async def cb_reschedule_my(callback: CallbackQuery):
             await callback.answer("Запись не найдена или уже изменена.", show_alert=True)
             return
 
-        delta = t.start_at - datetime.now()
+        delta = t.start_at - now_naive_local()
         if delta < timedelta(hours=4):
             await callback.answer(
                 "Перенести можно не позднее чем за 4 часа до тренировки.", show_alert=True
@@ -1028,7 +1078,7 @@ async def cb_reschedule_my(callback: CallbackQuery):
 
     user_states[user_id] = {"flow": "client_reschedule", "training_id": str(training_id)}
 
-    today = date.today()
+    today = today_local()
     await callback.message.edit_text(
         f"📅 {calendar_title(today)}\n\nВыбери новую дату для переноса тренировки:",
         reply_markup=generate_calendar_keyboard(today),
@@ -1142,7 +1192,7 @@ async def cb_client_card(callback: CallbackQuery):
         "Предстоящие и ожидающие итога:",
     ]
     if trainings:
-        now = datetime.now()
+        now = now_naive_local()
         for t in trainings[:10]:
             if t.start_at < now:
                 caption_lines.append(
@@ -1228,12 +1278,21 @@ async def handle_admin_text(message: Message):
             client.package_total = value
             client.package_remaining = max(client.package_remaining + diff, 0)
             session.commit()
+            session.refresh(client)
+            pkg_rem = client.package_remaining
+            c_username = client.username
+            c_first = client.first_name
 
+        admin_states.pop(message.from_user.id, None)
+        if c_username:
+            who = f"@{c_username}"
+        else:
+            who = c_first or "клиент (без @username)"
         await message.answer(
-            f"Для клиента обновлён пакет: всего {value}, осталось {client.package_remaining}.",
+            f"Клиенту {who} задано <b>{value}</b> тренировок.\n"
+            f"В пакете осталось: {pkg_rem}.",
             reply_markup=admin_menu_kb(),
         )
-        admin_states.pop(message.from_user.id, None)
         return True
 
     return False
@@ -1353,7 +1412,7 @@ async def cb_admin_cancel_training(callback: CallbackQuery):
     _, training_id_str = callback.data.split(":", 1)
     training_id = int(training_id_str)
 
-    now = datetime.now()
+    now = now_naive_local()
 
     with get_session() as session:
         t = session.get(Training, training_id)
@@ -1405,7 +1464,7 @@ async def cb_admin_reschedule_training(callback: CallbackQuery):
 
     user_states[admin_id] = {"flow": "admin_reschedule", "training_id": str(training_id)}
 
-    today = date.today()
+    today = today_local()
     await callback.message.edit_text(
         f"📅 {calendar_title(today)}\n\nВыбери новую дату для тренировки клиента:",
         reply_markup=generate_calendar_keyboard(today),
@@ -1418,66 +1477,123 @@ async def cb_close_msg(callback: CallbackQuery):
     await callback.answer()
 
 
-async def admin_show_all_trainings(message: Message, page: int = 0):
-    page_size = 10
-    offset = page * page_size
-
+async def admin_show_all_trainings(message: Message):
     with get_session() as session:
-        stmt_count = select(func.count(Training.id)).where(Training.status == "scheduled")
-        total = session.scalar(stmt_count)
-
-        stmt = (
-            select(Training)
-            .options(selectinload(Training.user))
-            .where(Training.status == "scheduled")
-            .order_by(Training.start_at.asc())
-            .offset(offset)
-            .limit(page_size)
+        cnt = session.scalar(
+            select(func.count(Training.id)).where(Training.status == "scheduled")
         )
-        trainings = session.scalars(stmt).all()
-
-        if not trainings:
-            await message.answer("Активных записей пока нет.")
-            return
-
-        text_lines = ["Все текущие записи:", ""]
-        for t in trainings:
-            un = t.user.username or t.user.first_name or "нет_username"
-            text_lines.append(
-                f"{t.start_at.strftime('%d.%m/%Y %H:%M')} (@{un}) — {status_label(t.status)}"
-            )
-        if total > page_size:
-            text_lines.append("")
-            text_lines.append(f"Страница {page + 1} из {(total + page_size - 1) // page_size}")
-
-    builder = InlineKeyboardBuilder()
-    if offset > 0:
-        builder.button(
-            text="⬅️ Назад",
-            callback_data=f"alltr_page:{page - 1}",
-        )
-    if offset + page_size < total:
-        builder.button(
-            text="Вперёд ➡️",
-            callback_data=f"alltr_page:{page + 1}",
-        )
-    builder.adjust(2)
+        has_any = (cnt or 0) > 0
 
     await message.answer(
-        "\n".join(text_lines),
-        reply_markup=builder.as_markup(),
+        admin_all_bookings_root_text(has_any),
+        reply_markup=build_admin_all_bookings_keyboard(),
     )
 
 
-async def cb_all_trainings_page(callback: CallbackQuery):
+async def cb_admin_all_bookings_root(callback: CallbackQuery):
     if not await reject_unless_admin(callback):
         return
-    if not callback.data:
+    with get_session() as session:
+        cnt = session.scalar(
+            select(func.count(Training.id)).where(Training.status == "scheduled")
+        )
+        has_any = (cnt or 0) > 0
+
+    await callback.message.edit_text(
+        admin_all_bookings_root_text(has_any),
+        reply_markup=build_admin_all_bookings_keyboard(),
+    )
+    await callback.answer()
+
+
+async def cb_admin_all_bookings_day(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
         return
-    _, page_str = callback.data.split(":", 1)
-    page = int(page_str)
-    await callback.message.delete()
-    await admin_show_all_trainings(callback.message, page=page)
+    if not callback.data or not callback.data.startswith("admtrbookday:"):
+        await callback.answer()
+        return
+    _, iso = callback.data.split(":", 1)
+    try:
+        target_date = date.fromisoformat(iso)
+    except ValueError:
+        await callback.answer("Неверная дата.", show_alert=True)
+        return
+
+    with get_session() as session:
+        stmt = (
+            select(Training)
+            .options(selectinload(Training.user))
+            .where(
+                and_(
+                    Training.status == "scheduled",
+                    func.date(Training.start_at) == target_date,
+                )
+            )
+            .order_by(Training.start_at)
+        )
+        rows = session.scalars(stmt).all()
+
+    if not rows:
+        body = (
+            f"Записи на <b>{target_date.strftime('%d.%m.%Y')}</b>:\n\n"
+            f"На этот день нет записей."
+        )
+    else:
+        lines = [
+            f"Записи на <b>{target_date.strftime('%d.%m.%Y')}</b>:",
+            "",
+        ]
+        for t in rows:
+            un = t.user.username or t.user.first_name or "—"
+            lines.append(
+                f"• {t.start_at.strftime('%H:%M')} — @{un} — {status_label(t.status)}"
+            )
+        body = "\n".join(lines)
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_ALL_ROOT)]
+        ]
+    )
+    await callback.message.edit_text(body, reply_markup=back_kb)
+    await callback.answer()
+
+
+async def cb_admin_all_bookings_all(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
+    now = now_naive_local()
+    with get_session() as session:
+        stmt = (
+            select(Training)
+            .options(selectinload(Training.user))
+            .where(
+                and_(
+                    Training.status == "scheduled",
+                    Training.start_at >= now,
+                )
+            )
+            .order_by(Training.start_at)
+        )
+        rows = session.scalars(stmt).all()
+
+    if not rows:
+        body = "Все предстоящие записи:\n\nНет активных записей."
+    else:
+        lines = ["Все предстоящие записи:", ""]
+        for t in rows:
+            un = t.user.username or t.user.first_name or "—"
+            lines.append(
+                f"• {t.start_at.strftime('%d.%m %H:%M')} (@{un}) — {status_label(t.status)}"
+            )
+        body = "\n".join(lines)
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=ADM_ALL_ROOT)]
+        ]
+    )
+    await callback.message.edit_text(body, reply_markup=back_kb)
     await callback.answer()
 
 
@@ -1548,7 +1664,7 @@ async def cb_training_post_resolve(callback: CallbackQuery):
         return
     tid = int(parts[1])
     action = parts[2]
-    today = date.today()
+    today = today_local()
 
     if action == "c":
         with get_session() as session:
@@ -1606,7 +1722,7 @@ async def cb_training_post_resolve(callback: CallbackQuery):
 
 async def reminders_worker(bot: Bot):
     while True:
-        now = datetime.now()
+        now = now_naive_local()
         window_start = now + timedelta(hours=2)
         window_end = window_start + timedelta(minutes=1)
 
@@ -1781,8 +1897,14 @@ async def main():
     async def w_admresch(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_admin_reschedule_training)
 
-    async def w_alltr_page(cq: CallbackQuery, **_kw):
-        await safe_callback_wrapper(cq, cb_all_trainings_page)
+    async def w_adm_all_root(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_all_bookings_root)
+
+    async def w_adm_all_all(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_all_bookings_all)
+
+    async def w_adm_all_day(cq: CallbackQuery, **_kw):
+        await safe_callback_wrapper(cq, cb_admin_all_bookings_day)
 
     async def w_close(cq: CallbackQuery, **_kw):
         await safe_callback_wrapper(cq, cb_close_msg)
@@ -1820,7 +1942,9 @@ async def main():
     dp.callback_query.register(w_admtr, F.data.startswith("admtr:"))
     dp.callback_query.register(w_admcancel, F.data.startswith("admcancel:"))
     dp.callback_query.register(w_admresch, F.data.startswith("admresch:"))
-    dp.callback_query.register(w_alltr_page, F.data.startswith("alltr_page:"))
+    dp.callback_query.register(w_adm_all_root, F.data == ADM_ALL_ROOT)
+    dp.callback_query.register(w_adm_all_all, F.data == ADM_ALL_ALL)
+    dp.callback_query.register(w_adm_all_day, F.data.startswith("admtrbookday:"))
     dp.callback_query.register(w_close, F.data == "close_msg")
     dp.callback_query.register(w_tpy, F.data.startswith("tpy:"))
     dp.callback_query.register(w_tpn, F.data.startswith("tpn:"))
