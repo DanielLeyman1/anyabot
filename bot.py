@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, time, date
 from typing import Optional, List, Dict
 
@@ -102,6 +103,22 @@ def ensure_db_columns():
 ensure_db_columns()
 
 
+def wipe_database():
+    """Полная очистка таблиц (продакшн-сброс)."""
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM trainings"))
+        conn.execute(text("DELETE FROM users"))
+
+
+def sync_all_admin_flags():
+    """Только один админ — ADMIN_ID; у остальных is_admin=False."""
+    with get_session() as session:
+        users = session.scalars(select(User)).all()
+        for u in users:
+            u.is_admin = u.tg_id == ADMIN_ID
+        session.commit()
+
+
 def get_session() -> Session:
     return SessionLocal()
 
@@ -192,7 +209,11 @@ def earliest_bookable_moment() -> datetime:
     return datetime.now() + BOOKING_MIN_ADVANCE
 
 
-def generate_time_keyboard(selected_date: date, existing_slots: List[datetime]) -> InlineKeyboardMarkup:
+def generate_time_keyboard(
+    selected_date: date,
+    existing_slots: List[datetime],
+    skip_min_advance: bool = False,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     start_time = time(9, 0)
@@ -209,8 +230,8 @@ def generate_time_keyboard(selected_date: date, existing_slots: List[datetime]) 
             dt += timedelta(minutes=15)
             continue
 
-        # Нельзя записаться «впритык»: минимум за час до начала
-        if dt < min_slot_start:
+        # Клиент: минимум за час до начала; перенос админом — без этого ограничения
+        if not skip_min_advance and dt < min_slot_start:
             dt += timedelta(minutes=15)
             continue
 
@@ -245,6 +266,18 @@ def status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
 
 
+def is_channel_admin(tg_user_id: int) -> bool:
+    return tg_user_id == ADMIN_ID
+
+
+async def reject_unless_admin(callback: CallbackQuery) -> bool:
+    """True если можно продолжать (пользователь — админ)."""
+    if not is_channel_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return False
+    return True
+
+
 async def ensure_user(message: Message) -> User:
     with get_session() as session:
         stmt = select(User).where(User.tg_id == message.from_user.id)
@@ -255,11 +288,17 @@ async def ensure_user(message: Message) -> User:
                 username=message.from_user.username,
                 first_name=message.from_user.first_name,
                 last_name=message.from_user.last_name,
-                is_admin=message.from_user.id == ADMIN_ID,
+                is_admin=is_channel_admin(message.from_user.id),
             )
             session.add(user)
-            session.commit()
-            session.refresh(user)
+        else:
+            user.username = message.from_user.username
+            user.first_name = message.from_user.first_name
+            user.last_name = message.from_user.last_name
+        # Единственный админ в системе — по ADMIN_ID
+        user.is_admin = is_channel_admin(user.tg_id)
+        session.commit()
+        session.refresh(user)
         return user
 
 
@@ -302,10 +341,14 @@ async def handle_contact(message: Message):
     with get_session() as session:
         stmt = select(User).where(User.tg_id == message.from_user.id)
         user = session.scalar(stmt)
+        if user:
+            user.is_admin = is_channel_admin(user.tg_id)
+            session.commit()
+            session.refresh(user)
 
     await message.answer(
         "Регистрация завершена! Теперь ты можешь записываться на тренировки.",
-        reply_markup=main_menu_kb(is_admin=user.is_admin if user else False),
+        reply_markup=main_menu_kb(is_admin=bool(user and user.is_admin)),
     )
 
 
@@ -334,7 +377,9 @@ async def handle_main_menu(message: Message):
         )
     elif text == "Мой пакет":
         await send_my_package(message, user)
-    elif text == "🛠 Админ панель" and user.is_admin:
+    elif text == "🛠 Админ панель" and user.is_admin and is_channel_admin(
+        message.from_user.id
+    ):
         await message.answer("Админ панель:", reply_markup=admin_menu_kb())
     elif text == "⬅️ Назад в меню":
         await message.answer(
@@ -347,9 +392,13 @@ async def handle_main_menu(message: Message):
         await start_cancel_reschedule_flow(message, user)
     elif text == "📋 Мои записи":
         await send_my_bookings(message, user)
-    elif text == "👥 Клиенты" and user.is_admin:
+    elif text == "👥 Клиенты" and user.is_admin and is_channel_admin(
+        message.from_user.id
+    ):
         await admin_show_clients(message, page=0)
-    elif text == "📆 Все записи" and user.is_admin:
+    elif text == "📆 Все записи" and user.is_admin and is_channel_admin(
+        message.from_user.id
+    ):
         await admin_show_all_trainings(message, page=0)
     else:
         await message.answer(
@@ -506,6 +555,9 @@ async def cb_select_date(callback: CallbackQuery):
     _, date_str = callback.data.split(":", 1)
     selected_date = date.fromisoformat(date_str)
 
+    st = user_states.get(callback.from_user.id, {})
+    skip_min = st.get("flow") == "admin_reschedule"
+
     with get_session() as session:
         stmt = (
             select(Training.start_at)
@@ -521,7 +573,9 @@ async def cb_select_date(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"Дата {selected_date.strftime('%d.%m')}. Выбери время:",
-        reply_markup=generate_time_keyboard(selected_date, existing_slots),
+        reply_markup=generate_time_keyboard(
+            selected_date, existing_slots, skip_min_advance=skip_min
+        ),
     )
 
     await callback.answer()
@@ -538,7 +592,8 @@ async def cb_select_time(callback: CallbackQuery):
     flow = state.get("flow")
 
     min_dt = earliest_bookable_moment()
-    if flow in ("booking", "client_reschedule", "admin_reschedule"):
+    # Перенос тренером — без ограничения «за час» (срочные правки расписания)
+    if flow in ("booking", "client_reschedule"):
         if selected_dt < min_dt:
             await callback.answer(
                 "Запись и перенос возможны только не позднее чем за 1 час до начала слота. "
@@ -659,6 +714,9 @@ async def cb_select_time(callback: CallbackQuery):
             user_states.pop(user_id, None)
             await callback.answer()
         elif flow == "admin_reschedule":
+            if not is_channel_admin(user_id):
+                await callback.answer("Нет доступа.", show_alert=True)
+                return
             training_id = state.get("training_id")
             if not training_id:
                 await callback.answer("Ошибка состояния переноса.", show_alert=True)
@@ -678,36 +736,49 @@ async def cb_select_time(callback: CallbackQuery):
                 )
                 return
 
-            t = session.get(Training, int(training_id))
-            if not t or t.status != "scheduled":
+            t = session.scalar(
+                select(Training)
+                .options(selectinload(Training.user))
+                .where(
+                    and_(
+                        Training.id == int(training_id),
+                        Training.status == "scheduled",
+                    )
+                )
+            )
+            if not t:
                 await callback.answer("Тренировка не найдена или уже изменена.", show_alert=True)
                 return
 
             old_time = t.start_at
+            client_tg = t.user.tg_id
+            client_uname = t.user.username or t.user.first_name or "клиент"
             t.start_at = selected_dt
             t.post_session_prompt_sent = False
             t.reminder_client_sent = False
             t.reminder_admin_sent = False
             session.commit()
 
+            new_when = selected_dt.strftime("%d.%m %H:%M")
+            old_when = old_time.strftime("%d.%m %H:%M")
+
             await callback.message.edit_text(
-                f"Тренировка перенесена с {old_time.strftime('%d.%m %H:%M')} "
-                f"на {t.start_at.strftime('%d.%m %H:%M')}."
+                f"Тренировка перенесена с {old_when} на {new_when}."
             )
 
             await callback.bot.send_message(
-                chat_id=t.user.tg_id,
+                chat_id=client_tg,
                 text=(
                     f"Твоя тренировка была перенесена тренером.\n"
-                    f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
+                    f"Новое время: {new_when}"
                 ),
             )
 
             await callback.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    f"Ты перенёс тренировку клиента @{t.user.username or t.user.first_name}\n"
-                    f"Новое время: {t.start_at.strftime('%d.%m %H:%M')}"
+                    f"Ты перенёс тренировку клиента @{client_uname}\n"
+                    f"Новое время: {new_when}"
                 ),
             )
 
@@ -879,6 +950,8 @@ async def admin_show_clients(message: Message, page: int = 0):
 
 
 async def cb_clients_page(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, page_str = callback.data.split(":", 1)
@@ -889,6 +962,8 @@ async def cb_clients_page(callback: CallbackQuery):
 
 
 async def cb_client_card(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, client_id_str = callback.data.split(":", 1)
@@ -912,11 +987,13 @@ async def cb_client_card(callback: CallbackQuery):
         )
         trainings = session.scalars(stmt).all()
 
-    client_name = f"{client.first_name or ''} {client.last_name or ''}".strip()
-    if not client_name:
-        client_name = f"@{client.username}" if client.username else f"ID {client.tg_id}"
+    if client.username:
+        client_line = f"👤 Клиент: @{client.username}"
+    else:
+        nm = f"{client.first_name or ''} {client.last_name or ''}".strip() or "без имени"
+        client_line = f"👤 Клиент: {nm} (нет @username, tg id: {client.tg_id})"
     caption_lines = [
-        f"👤 Клиент: {client_name}",
+        client_line,
         f"📱 Телефон: {client.phone or 'не указан'}",
         f"📦 Пакет: всего {client.package_total}, осталось {client.package_remaining}",
         "",
@@ -959,6 +1036,8 @@ admin_states: Dict[int, Dict[str, str]] = {}
 
 
 async def cb_set_package(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, client_id_str = callback.data.split(":", 1)
@@ -976,6 +1055,8 @@ async def cb_set_package(callback: CallbackQuery):
 
 
 async def handle_admin_text(message: Message):
+    if not is_channel_admin(message.from_user.id):
+        return False
     state = admin_states.get(message.from_user.id)
     if not state:
         return False
@@ -1017,6 +1098,8 @@ async def handle_admin_text(message: Message):
 
 
 async def cb_client_trainings(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, client_id_str = callback.data.split(":", 1)
@@ -1068,44 +1151,61 @@ async def cb_client_trainings(callback: CallbackQuery):
 
 
 async def cb_admin_training(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, training_id_str = callback.data.split(":", 1)
     training_id = int(training_id_str)
 
     with get_session() as session:
-        t = session.get(Training, training_id)
+        t = session.scalar(
+            select(Training)
+            .options(selectinload(Training.user))
+            .where(Training.id == training_id)
+        )
         if not t:
             await callback.answer("Тренировка не найдена.", show_alert=True)
             return
 
         client = t.user
+        cid = client.id
+        tun = client.username or client.first_name or "клиент"
+        tid = t.id
+        tst = t.start_at.strftime("%d.%m %H:%M")
+        st_lab = status_label(t.status)
+        is_scheduled = t.status == "scheduled"
 
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text="Отменить (вернуть/сжечь по правилу)",
-        callback_data=f"admcancel:{training_id}",
-    )
-    builder.button(
-        text="Перенести",
-        callback_data=f"admresch:{training_id}",
-    )
-    builder.adjust(1)
+    if is_scheduled:
+        builder.button(
+            text="Отменить (вернуть/сжечь по правилу)",
+            callback_data=f"admcancel:{training_id}",
+        )
+        builder.button(
+            text="Перенести",
+            callback_data=f"admresch:{training_id}",
+        )
+        builder.adjust(1)
     builder.row(
-        InlineKeyboardButton(text="Назад", callback_data=f"client_tr:{client.id}")
+        InlineKeyboardButton(text="Назад", callback_data=f"client_tr:{cid}")
     )
 
+    extra = "" if is_scheduled else "\n\n(Только просмотр — запись уже не активна.)"
     await callback.message.edit_text(
-        f"Тренировка ID {t.id}\n"
-        f"Клиент: @{client.username or client.first_name}\n"
-        f"Время: {t.start_at.strftime('%d.%m %H:%M')}\n"
-        f"Статус: {status_label(t.status)}",
+        f"Тренировка ID {tid}\n"
+        f"Клиент: @{tun}\n"
+        f"Время: {tst}\n"
+        f"Статус: {st_lab}"
+        + extra,
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
 
 
 async def cb_admin_cancel_training(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, training_id_str = callback.data.split(":", 1)
@@ -1130,16 +1230,21 @@ async def cb_admin_cancel_training(callback: CallbackQuery):
 
         session.commit()
 
+        # Все поля до закрытия сессии (иначе DetachedInstanceError после commit)
+        client_tg_id = client.tg_id
+        client_uname = client.username or client.first_name or "клиент"
+        when_str = t.start_at.strftime("%d.%m %H:%M")
+
     await callback.message.edit_text(
-        f"Тренировка клиента @{client.username or client.first_name} "
-        f"на {t.start_at.strftime('%d.%m %H:%M')} отменена тренером.\n"
+        f"Тренировка клиента @{client_uname} "
+        f"на {when_str} отменена тренером.\n"
         + ("Возврат в пакет." if refundable else "Меньше чем за 4 часа, тренировка сгорает."),
     )
 
     await callback.bot.send_message(
-        chat_id=client.tg_id,
+        chat_id=client_tg_id,
         text=(
-            f"Твоя тренировка {t.start_at.strftime('%d.%m %H:%M')} была отменена тренером.\n"
+            f"Твоя тренировка {when_str} была отменена тренером.\n"
             f"{'Тренировка вернулась в твой пакет.' if refundable else 'Меньше чем за 4 часа, тренировка сгорела.'}"
         ),
     )
@@ -1148,6 +1253,8 @@ async def cb_admin_cancel_training(callback: CallbackQuery):
 
 
 async def cb_admin_reschedule_training(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, training_id_str = callback.data.split(":", 1)
@@ -1174,27 +1281,32 @@ async def admin_show_all_trainings(message: Message, page: int = 0):
     offset = page * page_size
 
     with get_session() as session:
-        stmt_count = select(func.count(Training.id))
+        stmt_count = select(func.count(Training.id)).where(Training.status == "scheduled")
         total = session.scalar(stmt_count)
 
         stmt = (
             select(Training)
-            .order_by(Training.start_at.desc())
+            .options(selectinload(Training.user))
+            .where(Training.status == "scheduled")
+            .order_by(Training.start_at.asc())
             .offset(offset)
             .limit(page_size)
         )
         trainings = session.scalars(stmt).all()
 
         if not trainings:
-            await message.answer("Записей пока нет.")
+            await message.answer("Активных записей пока нет.")
             return
 
-        text_lines = [f"Все записи. Страница {page + 1}:"]
+        text_lines = ["Все текущие записи:", ""]
         for t in trainings:
+            un = t.user.username or t.user.first_name or "нет_username"
             text_lines.append(
-                f"{t.id}: {t.start_at.strftime('%d.%m %H:%M')} — {status_label(t.status)} — "
-                f"@{t.user.username or t.user.first_name}"
+                f"{t.start_at.strftime('%d.%m/%Y %H:%M')} (@{un}) — {status_label(t.status)}"
             )
+        if total > page_size:
+            text_lines.append("")
+            text_lines.append(f"Страница {page + 1} из {(total + page_size - 1) // page_size}")
 
     builder = InlineKeyboardBuilder()
     if offset > 0:
@@ -1216,6 +1328,8 @@ async def admin_show_all_trainings(message: Message, page: int = 0):
 
 
 async def cb_all_trainings_page(callback: CallbackQuery):
+    if not await reject_unless_admin(callback):
+        return
     if not callback.data:
         return
     _, page_str = callback.data.split(":", 1)
@@ -1440,13 +1554,18 @@ async def main():
     )
     dp = Dispatcher()
 
+    if os.environ.get("BOOKING_BOT_WIPE_DB", "").strip().lower() in ("1", "true", "yes"):
+        wipe_database()
+        logging.info("BOOKING_BOT_WIPE_DB: таблицы users/trainings очищены.")
+    sync_all_admin_flags()
+
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(handle_contact, F.contact)
 
     async def router_message_handler(message: Message):
         try:
             user = await ensure_user(message)
-            if user.is_admin:
+            if user.is_admin and is_channel_admin(message.from_user.id):
                 handled = await handle_admin_text(message)
                 if handled:
                     return

@@ -1,0 +1,7 @@
+# Локальная SQLite (не коммитим данные продакшена)
+booking_bot.db
+*.db
+
+.venv/
+__pycache__/
+*.pyc
