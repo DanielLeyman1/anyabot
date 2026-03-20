@@ -2441,8 +2441,13 @@ async def reminders_worker(bot: Bot):
 
 
 async def main():
-    connector = aiohttp.TCPConnector(family=socket.AF_INET)
-    session = AiohttpSession(connector=connector)
+    # Aiogram's AiohttpSession не принимает параметр connector напрямую (передача ломает init).
+    # Поэтому выставляем параметры TCPConnector через приватный _connector_init.
+    session = AiohttpSession()
+    try:
+        session._connector_init["family"] = socket.AF_INET  # type: ignore[attr-defined]
+    except Exception:
+        pass
     bot = Bot(
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
