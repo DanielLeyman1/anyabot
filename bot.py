@@ -68,6 +68,22 @@ def today_local() -> date:
     return datetime.now(APP_TZ).date()
 
 
+def log_proxy_brief(proxy: str) -> None:
+    """Log proxy host/port only (no credentials)."""
+    try:
+        from urllib.parse import urlparse
+
+        u = urlparse(proxy)
+        host = u.hostname or proxy
+        port = u.port
+        if port is not None:
+            logging.info("BOT_PROXY detected for Telegram: %s:%s", host, port)
+        else:
+            logging.info("BOT_PROXY detected for Telegram: %s", host)
+    except Exception:
+        logging.info("BOT_PROXY detected for Telegram.")
+
+
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 Base = declarative_base()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
@@ -2441,9 +2457,12 @@ async def reminders_worker(bot: Bot):
 async def main():
     proxy = os.environ.get("BOT_PROXY", "").strip()
     if proxy:
-        # В лог не пишем значение прокси (там могут быть креды).
-        logging.info("Using BOT_PROXY for Telegram connectivity.")
-        session = AiohttpSession(proxy=proxy)
+        log_proxy_brief(proxy)
+        try:
+            session = AiohttpSession(proxy=proxy)
+        except Exception as e:
+            logging.exception("Failed to init proxy session, fallback to direct: %s", e)
+            session = AiohttpSession()
     else:
         session = AiohttpSession()
     bot = Bot(
