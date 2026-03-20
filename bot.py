@@ -1,12 +1,10 @@
 import asyncio
 import logging
 import os
-import socket
 from datetime import datetime, timedelta, time, date
 from typing import Optional, List, Dict
 from zoneinfo import ZoneInfo
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -2441,13 +2439,13 @@ async def reminders_worker(bot: Bot):
 
 
 async def main():
-    # Aiogram's AiohttpSession не принимает параметр connector напрямую (передача ломает init).
-    # Поэтому выставляем параметры TCPConnector через приватный _connector_init.
-    session = AiohttpSession()
-    try:
-        session._connector_init["family"] = socket.AF_INET  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    proxy = os.environ.get("BOT_PROXY", "").strip()
+    if proxy:
+        # В лог не пишем значение прокси (там могут быть креды).
+        logging.info("Using BOT_PROXY for Telegram connectivity.")
+        session = AiohttpSession(proxy=proxy)
+    else:
+        session = AiohttpSession()
     bot = Bot(
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
