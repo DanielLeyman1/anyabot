@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import os
+import socket
 from datetime import datetime, timedelta, time, date
 from typing import Optional, List, Dict
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -37,7 +40,9 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = "7348147274:AAEqXWiK10yRvk36Pe3xtWuNl_ac_FqSMqc"
+API_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not API_TOKEN:
+    raise RuntimeError("BOT_TOKEN env var is required.")
 ADMIN_ID = 1652603985
 
 DATABASE_URL = "sqlite:///booking_bot.db"
@@ -53,6 +58,7 @@ SERVICE_MASSAGE = "massage"
 
 # Часовой пояс расписания (слоты и «сейчас» для записи)
 APP_TZ = ZoneInfo("Asia/Yekaterinburg")
+POLLING_RETRY_SECONDS = 5
 
 
 def now_naive_local() -> datetime:
@@ -2347,93 +2353,100 @@ async def cb_training_post_resolve(callback: CallbackQuery):
 
 async def reminders_worker(bot: Bot):
     while True:
-        now = now_naive_local()
-        window_start = now + timedelta(hours=2)
-        window_end = window_start + timedelta(minutes=1)
+        try:
+            now = now_naive_local()
+            window_start = now + timedelta(hours=2)
+            window_end = window_start + timedelta(minutes=1)
 
-        with get_session() as session:
-            stmt = (
-                select(Training)
-                .where(
-                    and_(
-                        Training.status == "scheduled",
-                        Training.start_at >= window_start,
-                        Training.start_at < window_end,
+            with get_session() as session:
+                stmt = (
+                    select(Training)
+                    .where(
+                        and_(
+                            Training.status == "scheduled",
+                            Training.start_at >= window_start,
+                            Training.start_at < window_end,
+                        )
                     )
                 )
-            )
-            trainings = session.scalars(stmt).all()
+                trainings = session.scalars(stmt).all()
 
-            for t in trainings:
-                if not t.reminder_client_sent:
-                    try:
-                        bot_text = (
-                            f"Напоминание! Через 2 часа у тебя тренировка "
-                            f"{t.start_at.strftime('%d.%m %H:%M')}."
-                        )
-                        await bot.send_message(chat_id=t.user.tg_id, text=bot_text)
-                        t.reminder_client_sent = True
-                    except Exception as e:
-                        logging.exception(f"Failed to send client reminder: {e}")
+                for t in trainings:
+                    if not t.reminder_client_sent:
+                        try:
+                            bot_text = (
+                                f"Напоминание! Через 2 часа у тебя тренировка "
+                                f"{t.start_at.strftime('%d.%m %H:%M')}."
+                            )
+                            await bot.send_message(chat_id=t.user.tg_id, text=bot_text)
+                            t.reminder_client_sent = True
+                        except Exception as e:
+                            logging.exception(f"Failed to send client reminder: {e}")
 
-                if not t.reminder_admin_sent:
-                    try:
-                        admin_text = (
-                            f"Напоминание! Через 2 часа тренировка с "
-                            f"@{t.user.username or t.user.first_name} "
-                            f"{t.start_at.strftime('%d.%m %H:%M')}."
-                        )
-                        await bot.send_message(chat_id=ADMIN_ID, text=admin_text)
-                        t.reminder_admin_sent = True
-                    except Exception as e:
-                        logging.exception(f"Failed to send admin reminder: {e}")
+                    if not t.reminder_admin_sent:
+                        try:
+                            admin_text = (
+                                f"Напоминание! Через 2 часа тренировка с "
+                                f"@{t.user.username or t.user.first_name} "
+                                f"{t.start_at.strftime('%d.%m %H:%M')}."
+                            )
+                            await bot.send_message(chat_id=ADMIN_ID, text=admin_text)
+                            t.reminder_admin_sent = True
+                        except Exception as e:
+                            logging.exception(f"Failed to send admin reminder: {e}")
 
-            # Через 1 час после начала слота — спросить админа, прошла ли тренировка
-            follow_cutoff = now - timedelta(hours=1)
-            stmt_follow = (
-                select(Training)
-                .options(selectinload(Training.user))
-                .where(
-                    and_(
-                        Training.status == "scheduled",
-                        Training.start_at <= follow_cutoff,
-                        or_(
-                            Training.post_session_prompt_sent == False,
-                            Training.post_session_prompt_sent.is_(None),
+                # Через 1 час после начала слота — спросить админа, прошла ли тренировка
+                follow_cutoff = now - timedelta(hours=1)
+                stmt_follow = (
+                    select(Training)
+                    .options(selectinload(Training.user))
+                    .where(
+                        and_(
+                            Training.status == "scheduled",
+                            Training.start_at <= follow_cutoff,
+                            or_(
+                                Training.post_session_prompt_sent == False,
+                                Training.post_session_prompt_sent.is_(None),
+                            ),
                         ),
                     )
                 )
-            )
-            for t in session.scalars(stmt_follow).all():
-                try:
-                    u = t.user
-                    uname = u.username or u.first_name or "клиент"
-                    fb = InlineKeyboardBuilder()
-                    fb.button(text="✅ Да, прошла", callback_data=f"tpy:{t.id}")
-                    fb.button(text="❌ Нет", callback_data=f"tpn:{t.id}")
-                    fb.adjust(2)
-                    await bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            f"⏱ Тренировка {t.start_at.strftime('%d.%m %H:%M')} "
-                            f"с @{uname} уже должна была начаться (прошёл час).\n\n"
-                            f"Она прошла?"
-                        ),
-                        reply_markup=fb.as_markup(),
-                    )
-                    t.post_session_prompt_sent = True
-                except Exception as e:
-                    logging.exception(f"Failed post-training follow-up: {e}")
+                for t in session.scalars(stmt_follow).all():
+                    try:
+                        u = t.user
+                        uname = u.username or u.first_name or "клиент"
+                        fb = InlineKeyboardBuilder()
+                        fb.button(text="✅ Да, прошла", callback_data=f"tpy:{t.id}")
+                        fb.button(text="❌ Нет", callback_data=f"tpn:{t.id}")
+                        fb.adjust(2)
+                        await bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                f"⏱ Тренировка {t.start_at.strftime('%d.%m %H:%M')} "
+                                f"с @{uname} уже должна была начаться (прошёл час).\n\n"
+                                f"Она прошла?"
+                            ),
+                            reply_markup=fb.as_markup(),
+                        )
+                        t.post_session_prompt_sent = True
+                    except Exception as e:
+                        logging.exception(f"Failed post-training follow-up: {e}")
 
-            session.commit()
+                session.commit()
+        except Exception as e:
+            # Защита фонового worker от падения при временных сетевых сбоях.
+            logging.exception(f"reminders_worker loop error: {e}")
 
         await asyncio.sleep(60)
 
 
 async def main():
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    session = AiohttpSession(connector=connector)
     bot = Bot(
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML"),
+        session=session,
     )
     dp = Dispatcher()
 
@@ -2616,7 +2629,13 @@ async def main():
     asyncio.create_task(reminders_worker(bot))
 
     logging.info("Bot started.")
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except Exception as e:
+            logging.exception(f"Polling crashed, retrying in {POLLING_RETRY_SECONDS}s: {e}")
+            await asyncio.sleep(POLLING_RETRY_SECONDS)
 
 
 if __name__ == "__main__":

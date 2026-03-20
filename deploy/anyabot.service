@@ -1,0 +1,18 @@
+[Unit]
+Description=Anyabot Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/anyabot
+ExecStart=/root/anyabot/venv/bin/python /root/anyabot/bot.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+User=root
+Environment=PYTHONUNBUFFERED=1
+Environment=BOT_TOKEN=PUT_NEW_TOKEN_HERE
+
+[Install]
+WantedBy=multi-user.target
